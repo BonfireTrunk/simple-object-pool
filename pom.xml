@@ -6,7 +6,7 @@
 
     <groupId>today.bonfire.oss</groupId>
     <artifactId>simple-object-pool</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
 
     <properties>
         <java.version>21</java.version>
