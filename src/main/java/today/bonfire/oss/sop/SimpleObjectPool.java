@@ -15,6 +15,11 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+/**
+ * A generic object pool that manages the lifecycle of pooled objects.
+ * It supports borrowing, returning, and eviction of objects based on configurable parameters.
+ * @param <T> The type of object to be pooled, must implement {@link PoolEntity}
+ */
 @Slf4j
 public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
   private final int                                  maxPoolSize;
@@ -149,6 +154,10 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
     }
   }
 
+  /**
+   * Destroys a pooled object using the object factory.
+   * @param pooledEntity The pooled entity to destroy
+   */
   private void destroyObject(PooledEntity<T> pooledEntity) {
     borrowedObjects.remove(pooledEntity.getEntityId());
     objectFactory.destroyObject(pooledEntity.getObject());
@@ -254,6 +263,10 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
     returnObject(obj, false);
   }
 
+  /**
+   * Closes the object pool and releases all resources.
+   * This method shuts down the scheduler and destroys all pooled objects.
+   */
   @Override
   public void close() {
     log.info("Closing object pool");
