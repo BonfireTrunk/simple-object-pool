@@ -1,22 +1,42 @@
 package today.bonfire.oss.sop;
 
+/**
+ * Represents an entity that can be managed by a {@link SimpleObjectPool}.  Each implementing class must provide a unique identifier.
+ */
 public interface PoolEntity {
 
   /**
-   * Retrieves the unique identifier of the entity.
-   * Failure to maintain this will cause the pool logic to fail and
-   * cause issues.
+   * Retrieves the unique identifier for this entity.
+   * This ID is used internally by the object pool for tracking and management.
+   * It must remain consistent for the lifetime of the object.
    *
-   * @return the unique identifier for the life of the JVM of the entity as a Long.
+   * @return The unique identifier for this entity.
    */
   Long getEntityId();
 
   /**
-   * Sets the unique identifier of the entity.
-   * END USERS SHOULD NOT SET THIS VALUE.
-   * This value is set by the library only.
+   * Sets the unique identifier for this entity.
+   * This method should only be called by the {@link SimpleObjectPool} implementation.
+   * Directly setting this value may lead to unexpected behavior.
+   * <p>
+   * Example:
+   * <pre>{@code
+   * public class MyPooledObject implements PoolEntity {
+   *   private Long entityId;
    *
-   * @param entityIdValue the unique identifier to set for the entity.
+   *   @Override
+   *   public Long getEntityId() {
+   *     return entityId;
+   *   }
+   *
+   *   @Override
+   *   public void setEntityId(Long entityIdValue) {
+   *     this.entityId = entityIdValue;
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param entityIdValue The unique identifier to set for this entity.
    */
   void setEntityId(Long entityIdValue);
 

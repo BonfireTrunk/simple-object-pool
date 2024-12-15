@@ -6,7 +6,7 @@
 
     <groupId>today.bonfire.oss</groupId>
     <artifactId>simple-object-pool</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.0.0</version>
 
     <properties>
         <java.version>21</java.version>
@@ -18,31 +18,44 @@
     </properties>
 
     <name>${project.groupId}:${project.artifactId}</name>
-    <description>Simple object pool is a library that provides pool management for objects such as database connections or network connections.
-        It uses ReentrantLock to provide thread-safe access to the pool.
-        This was started to provide an object pool for valkey using jedis library for java 21.
+    <description>A lightweight, thread-safe object pooling library for Java applications.
+        Features:
+        - Thread-safe object pooling using ReentrantLock
+        - Configurable pool size with min and max limits
+        - Automatic idle object eviction
+        - Abandoned object detection and cleanup
+        - Support for object validation and health checks
+        - Simple and intuitive API
+        - Zero external dependencies (except SLF4J for logging)
+        - Java 21+ compatible
+
+        Perfect for managing expensive resources like database connections, network sockets, or any reusable objects.
+        (can be used for jedis, redisson, etc.)
     </description>
-    <url>https://www.bonfire.today</url>
+    <url>https://github.com/BonfireTrunk/simple-object-pool</url>
 
     <licenses>
         <license>
             <name>The Apache License, Version 2.0</name>
             <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
         </license>
     </licenses>
 
     <developers>
         <developer>
-            <name>Developers</name>
+            <name>Bonfire Team</name>
+            <email>support@bonfire.today</email>
             <organization>Bonfire</organization>
             <organizationUrl>https://github.com/BonfireTrunk</organizationUrl>
         </developer>
     </developers>
 
     <scm>
-        <connection>scm:git:git://github.com:BonfireTrunk/simple-object-pool.git</connection>
-        <developerConnection>scm:git:ssh://github.com:BonfireTrunk/simple-object-pool.git</developerConnection>
+        <connection>scm:git:git://github.com/BonfireTrunk/simple-object-pool.git</connection>
+        <developerConnection>scm:git:ssh://github.com/BonfireTrunk/simple-object-pool.git</developerConnection>
         <url>https://github.com/BonfireTrunk/simple-object-pool</url>
+        <tag>HEAD</tag>
     </scm>
     <dependencyManagement>
         <dependencies>
@@ -121,6 +134,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
                 <configuration>
                     <release>${java.version}</release>
                     <compilerArgs>
@@ -170,7 +184,8 @@
                         </executions>
                     </plugin>
                     <plugin>
-                        <!-- https://mvnrepository.com/artifact/org.apache.maven.plugins/maven-gpg-plugin -->
+                        <!--
+                        https://mvnrepository.com/artifact/org.apache.maven.plugins/maven-gpg-plugin -->
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-gpg-plugin</artifactId>
                         <version>3.2.7</version>
@@ -184,7 +199,6 @@
                                 </goals>
                                 <configuration>
                                     <keyname>${gpg.keyname}</keyname>
-                                    <passphraseServerId>${gpg.keyname}</passphraseServerId>
                                     <gpgArguments>
                                         <arg>--pinentry-mode</arg>
                                         <arg>loopback</arg>
@@ -201,6 +215,7 @@
                         <configuration>
                             <publishingServerId>central</publishingServerId>
                             <checksums>all</checksums>
+                            <waitUntil>uploaded</waitUntil>
                         </configuration>
                     </plugin>
                 </plugins>
