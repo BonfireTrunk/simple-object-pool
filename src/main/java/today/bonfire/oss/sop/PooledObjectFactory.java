@@ -1,5 +1,12 @@
 package today.bonfire.oss.sop;
 
+/**
+ * Provides a factory for creating pooled objects.
+ * Implementations should provide a concrete type of T that implements the
+ * {@link PoolEntity} interface.
+ *
+ * @param <T> the type of object to be pooled, must implement {@link PoolEntity}
+ */
 public interface PooledObjectFactory<T extends PoolEntity> {
 
   /**
