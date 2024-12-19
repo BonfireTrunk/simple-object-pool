@@ -34,9 +34,10 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
   private final Map<Long, PooledEntity<T>>           borrowedObjects = new ConcurrentHashMap<>();
   private final ReentrantLock                        lock            = new ReentrantLock();
   private final Condition                            notEmpty        = lock.newCondition();
-  private final PooledObjectFactory<T>               objectFactory;
-  private final AtomicLong                           idCounter       = new AtomicLong(0);
-  private final ScheduledExecutorService             scheduler       = Executors.newSingleThreadScheduledExecutor();
+
+  private final PooledObjectFactory<T>   factory;
+  private final AtomicLong               idCounter = new AtomicLong(0);
+  private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
   /**
    * Creates a new SimpleObjectPool instance with specified configuration parameters.
@@ -45,15 +46,15 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
    * @param minPoolSize            The minimum number of idle objects to maintain in the pool
    * @param idleEvictionTimeout    Duration in milliseconds after which idle objects exceeding minPoolSize will be evicted
    * @param abandonedObjectTimeout Duration in milliseconds after which borrowed objects are considered abandoned
-   * @param objectFactory          Factory to create, validate and destroy pooled objects
+   * @param factory                Factory to create, validate and destroy pooled objects
    * @throws IllegalArgumentException if minPoolSize is greater than maxPoolSize or less than 1
    */
-  public SimpleObjectPool(int maxPoolSize, int minPoolSize, long idleEvictionTimeout, long abandonedObjectTimeout, PooledObjectFactory<T> objectFactory) {
+  public SimpleObjectPool(int maxPoolSize, int minPoolSize, long idleEvictionTimeout, long abandonedObjectTimeout, PooledObjectFactory<T> factory) {
     this.maxPoolSize                  = maxPoolSize;
     this.minPoolSize                  = minPoolSize;
     this.idleEvictionTimeoutMillis    = Math.max(idleEvictionTimeout, 0);
     this.abandonedObjectTimeoutMillis = Math.max(abandonedObjectTimeout, MINIMUM_ABANDON_TIMEOUT);
-    this.objectFactory                = objectFactory;
+    this.factory = factory;
     if (minPoolSize > maxPoolSize) {
       throw new IllegalArgumentException("minIdleObjects cannot be greater than maxPoolSize");
     }
@@ -80,7 +81,7 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
       lock.lock();
       // Remove expired idle objects and collect them for destruction
       idleObjects.removeIf(pooledEntity -> {
-        if (!objectFactory.isObjectValid(pooledEntity.getObject())) {
+        if (!factory.isObjectValid(pooledEntity.getObject())) {
           // Collect the object for destruction
           objectsToDestroy.add(pooledEntity);
           return true; // Indicate that this object should be removed
@@ -135,6 +136,31 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
   }
 
   /**
+   * Destroys all idle objects in the pool.
+   * This method removes and destroys all objects from the idle queue,
+   * regardless of the minimum pool size or idle time.
+   */
+  public void destroyAllIdleObjects() {
+    try {
+      lock.lock();
+      // Collect all idle objects for destruction
+      var objectsToDestroy = new ArrayList<>(idleObjects);
+      idleObjects.clear();
+
+      // Destroy collected objects
+      for (PooledEntity<T> pooledEntity : objectsToDestroy) {
+        log.debug("Destroying idle object with id {}.", pooledEntity.getEntityId());
+        removeAndDestroyObject(pooledEntity);
+      }
+      log.info("Destroyed {} idle objects.", objectsToDestroy.size());
+    } catch (Exception e) {
+      log.error("Error destroying all idle objects", e);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
    * Internal method to detect and remove objects that have been borrowed but not returned within abandonedObjectTimeout.
    * This helps prevent resource leaks when clients fail to return objects.
    * Abandoned objects are destroyed using the objectFactory.
@@ -168,7 +194,7 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
    */
   private void removeAndDestroyObject(PooledEntity<T> pooledEntity) {
     borrowedObjects.remove(pooledEntity.getEntityId());
-    objectFactory.destroyObject(pooledEntity.getObject());
+    factory.destroyObject(pooledEntity.getObject());
   }
 
   /**
@@ -207,7 +233,7 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
         if (pooledEntity == null) {
           if (borrowedObjects.size() < maxPoolSize && initialCount < maxPoolSize) {
             initialCount++;
-            pooledEntity = new PooledEntity<>(objectFactory.createObject(), idCounter.incrementAndGet());
+            pooledEntity = new PooledEntity<>(factory.createObject(), idCounter.incrementAndGet());
             log.debug("Created new resource in pool with id {}", pooledEntity.getEntityId());
           } else {
             remainingNanos = notEmpty.awaitNanos(remainingNanos);
@@ -219,7 +245,7 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
         }
 
 
-        if (objectFactory.isObjectValidForBorrow(pooledEntity.getObject())) {
+        if (factory.isObjectValidForBorrow(pooledEntity.getObject())) {
           pooledEntity.borrow();
           borrowedObjects.put(pooledEntity.getEntityId(), pooledEntity);
           log.trace("Resource borrowed - id: {}, current pool size: {}", pooledEntity.getEntityId(), idleObjects.size() + borrowedObjects.size());
@@ -257,7 +283,7 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
     try {
       if (pooledEntity != null) {
         if (broken) pooledEntity.setBroken(true);
-        if (pooledEntity.isBroken() || !objectFactory.isObjectValid(obj)) {
+        if (pooledEntity.isBroken() || !factory.isObjectValid(obj)) {
           removeAndDestroyObject(pooledEntity);
           log.warn("Returned broken or invalid entity with id {} and destroyed it.", pooledEntity.getEntityId());
         } else {
@@ -276,7 +302,7 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
     }
 
     if (orphanedObject != null) {
-      objectFactory.destroyObject(orphanedObject);
+      factory.destroyObject(orphanedObject);
     }
   }
 
@@ -322,5 +348,9 @@ public class SimpleObjectPool<T extends PoolEntity> implements AutoCloseable {
     } finally {
       lock.unlock();
     }
+  }
+
+  public PooledObjectFactory<T> getFactory() {
+    return factory;
   }
 }
