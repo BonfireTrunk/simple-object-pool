@@ -1,5 +1,7 @@
 package today.bonfire.oss.sop;
 
+import java.util.Objects;
+
 /**
  * Represents a wrapper for pooled objects that maintains state information about the object's usage.
  * This class tracks whether an object is borrowed, broken, or idle, and manages its usage timestamps.
@@ -44,7 +46,7 @@ public class PooledObject<T extends PoolObject> {
    *
    * @return The creation timestamp in milliseconds.
    */
-  public long getCreationTime() {
+  public long creationTime() {
     return creationTime;
   }
 
@@ -130,5 +132,26 @@ public class PooledObject<T extends PoolObject> {
    */
   public long idlingTime() {
     return System.currentTimeMillis() - idleFromTime;
+  }
+
+  @Override
+  public int hashCode() {
+    return Long.hashCode(id());
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (!(o instanceof PooledObject<?> that)) return false;
+    return Objects.equals(id(), that.id());
+  }
+
+  /**
+   * Returns the number of times this object has been borrowed
+   *
+   * @return borrow count
+   */
+  public long borrowCount() {
+    return timesBorrowed;
   }
 }
