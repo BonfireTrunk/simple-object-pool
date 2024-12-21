@@ -3,7 +3,7 @@ package today.bonfire.oss.sop;
 /**
  * Represents an entity that can be managed by a {@link SimpleObjectPool}.  Each implementing class must provide a unique identifier.
  */
-public interface PoolEntity {
+public interface PoolObject {
 
   /**
    * Retrieves the unique identifier for this entity.
