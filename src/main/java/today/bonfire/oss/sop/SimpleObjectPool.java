@@ -6,6 +6,7 @@ import today.bonfire.oss.sop.exceptions.PoolObjectException;
 import today.bonfire.oss.sop.exceptions.PoolObjectValidationException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -109,6 +110,12 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
                                       .sorted(Comparator.comparingLong(PooledObject::borrowCount))
                                       .toList();
         }
+        case MOST_USED -> {
+          // Sort by usage count and take the most used
+          objectsForTest = idleObjects.stream()
+                                      .sorted((o1, o2) -> Long.compare(o2.borrowCount(), o1.borrowCount()))
+                                      .toList();
+        }
       }
 
       // Test selected objects
@@ -117,7 +124,8 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         // Check if object is idle for too long
         if (pooledObject.idlingTime() > config.objEvictionTimeout()) {
           shouldEvict = true;
-        } else if (config.testWhileIdle() && numToTest > 0) {
+        } else if (config.testWhileIdle()) {
+          if (numToTest <= 0) break;
           try {
             numToTest--;
             if (!factory.isObjectValid(pooledObject.object())) {
@@ -149,8 +157,11 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     for (PooledObject<T> pooledObject : objectsToDestroy) {
       try {
         factory.destroyObject(pooledObject.object());
-        log.debug("Destroying idle object with id {} idling for {}ms",
-                  pooledObject.id(), pooledObject.idlingTime());
+        log.debug("Destroying object during eviction run with id {}, " +
+                  "created {} ago, " +
+                  "idling for {}ms " +
+                  "used {} time(s), ",
+                  pooledObject.id(), Duration.ofMillis(System.currentTimeMillis() - pooledObject.creationTime()), pooledObject.idlingTime(), pooledObject.borrowCount());
       } catch (Exception e) {
         log.warn("Failed to destroy object with id {}", pooledObject.id(), e);
       }

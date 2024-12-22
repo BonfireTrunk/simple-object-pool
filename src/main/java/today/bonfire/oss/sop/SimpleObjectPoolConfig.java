@@ -183,7 +183,8 @@ public class SimpleObjectPoolConfig {
   public enum EvictionPolicy {
     OLDEST_FIRST,
     LEAST_USED,
-    RANDOM // Default
+    MOST_USED,
+    RANDOM // Default fastest
   }
 
   /**
