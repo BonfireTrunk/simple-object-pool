@@ -156,6 +156,10 @@ public class SimpleObjectPoolConfig {
     return new Builder();
   }
 
+  public static SimpleObjectPoolConfig defaultConfig() {
+    return new Builder().build();
+  }
+
   public Builder toBuilder() {
     return new Builder()
         .maxPoolSize(this.maxPoolSize)
@@ -197,7 +201,7 @@ public class SimpleObjectPoolConfig {
     private Duration       durationBetweenAbandonCheckRuns = Duration.ofSeconds(60);
     private Duration       abandonedTimeout                = Duration.ofSeconds(60);
     private Duration       durationBetweenEvictionsRuns    = Duration.ofMinutes(5);
-    private Duration       objEvictionTimeout           = Duration.ofMinutes(10);
+    private Duration       objEvictionTimeout           = Duration.ofMinutes(5);
     private Integer        numValidationsPerEvictionRun = null;
     private EvictionPolicy evictionPolicy               = EvictionPolicy.RANDOM;
     private Integer        maxRetries                      = null;
@@ -346,6 +350,7 @@ public class SimpleObjectPoolConfig {
     /**
      * Sets the eviction policy to use when evicting objects from the pool.
      * Defaults to {@link EvictionPolicy#RANDOM} if not set.
+     *
      * @param evictionPolicy The eviction policy.
      * @return This {@code Builder} instance.
      */

@@ -305,19 +305,21 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         }
 
         // Validate object before borrowing if configured
-        if (config.testOnBorrow() && !factory.isObjectValidForBorrow(pooledObject.object())) {
+        final var object = pooledObject.object();
+        if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
           removeAndDestroyBorrowedObjects(pooledObject);
           continue;
         }
 
         // Object is valid, prepare for borrowing
         pooledObject.borrow();
+        factory.activateObject(object);
         borrowedObjects.put(pooledObject.id(), pooledObject);
         if (createdObject) currentPoolSize.incrementAndGet();
         notEmpty.signal();
         log.trace("Resource borrowed - id: {}, current pool size: {}",
                   pooledObject.id(), currentPoolSize.get());
-        return pooledObject.object();
+        return object;
       }
 
       throw new PoolTimeoutException("Timeout waiting for an available object to borrow");
