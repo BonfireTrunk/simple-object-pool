@@ -4,12 +4,11 @@
     <import class="ch.qos.logback.classic.filter.ThresholdFilter"/>
     <import class="ch.qos.logback.core.rolling.RollingFileAppender"/>
     <import class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy"/>
-    <import class="ch.qos.logback.classic.AsyncAppender"/>
     <import class="ch.qos.logback.core.ConsoleAppender"/>
 
     <appender name="FILE" class="RollingFileAppender">
         <file>logs/app.log</file>
-        <immediateFlush>false</immediateFlush>
+        <immediateFlush>true</immediateFlush>
         <rollingPolicy class="TimeBasedRollingPolicy">
             <fileNamePattern>logs/app_%d{yyyy-MM-dd}.log</fileNamePattern>
             <maxHistory>5</maxHistory>
@@ -23,10 +22,6 @@
         </filter>
     </appender>
 
-    <appender name="ASYNC" class="AsyncAppender">
-        <appender-ref ref="FILE"/>
-    </appender>
-
     <appender name="STDOUT" class="ConsoleAppender">
         <encoder class="PatternLayoutEncoder">
             <pattern>%black(%d{yyMMddHHmmss}) %highlight(%-5level) %magenta([%thread] %-16.16logger{5}) %yellow(%X{uid:-ND}) : %boldCyan(%msg%n%ex{short})</pattern>
@@ -36,9 +31,9 @@
         </filter>
     </appender>
 
-    <root level="DEBUG">
+    <root level="TRACE">
         <appender-ref ref="STDOUT"/>
-        <appender-ref ref="ASYNC"/>
+        <appender-ref ref="FILE"/>
     </root>
 
 </configuration>

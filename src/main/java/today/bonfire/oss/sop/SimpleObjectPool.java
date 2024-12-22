@@ -30,18 +30,16 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
   private static final Logger log = org.slf4j.LoggerFactory.getLogger(SimpleObjectPool.class);
 
-  private final LinkedBlockingQueue<PooledObject<T>> idleObjects     = new LinkedBlockingQueue<>();
-  private final Map<Long, PooledObject<T>>           borrowedObjects = new ConcurrentHashMap<>();
-  private final ScheduledExecutorService             scheduler       = Executors.newSingleThreadScheduledExecutor();
+  private final LinkedBlockingQueue<PooledObject<T>> idleObjects       = new LinkedBlockingQueue<>();
+  private final Map<Long, PooledObject<T>>           borrowedObjects   = new ConcurrentHashMap<>();
+  private final ScheduledExecutorService             scheduler         = Executors.newSingleThreadScheduledExecutor();
   private final PooledObjectFactory<T>               factory;
   private final SimpleObjectPoolConfig               config;
   private final ReentrantLock                        lock;
   private final Condition                            notEmpty;
   private final Condition                            retryCreationWait;
-
-  private final AtomicLong    objectCreateCount = new AtomicLong(0);
-  private final AtomicInteger currentPoolSize   = new AtomicInteger(0);
-
+  private final AtomicLong                           objectCreateCount = new AtomicLong(0);
+  private final AtomicInteger                        currentPoolSize   = new AtomicInteger(0);
 
   public SimpleObjectPool(SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
     this.config       = config;
@@ -61,9 +59,20 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     }
   }
 
+
   public SimpleObjectPool(PooledObjectFactory<T> factory) {
     this(SimpleObjectPoolConfig.builder().build(), factory);
 
+  }
+
+
+  /**
+   * Returns the configuration used by this object pool.
+   *
+   * @return the configuration used by this object pool
+   */
+  public SimpleObjectPoolConfig config() {
+    return config;
   }
 
   /**
@@ -129,6 +138,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           objectsToDestroy.add(pooledObject);
         }
       }
+
     } catch (Exception e) {
       log.error("Error during eviction run", e);
     } finally {
@@ -191,16 +201,17 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    */
   private void abandonCheckRun() {
     List<PooledObject<T>> objectsToRemove = new ArrayList<>();
+    var                   now             = System.currentTimeMillis();
     try {
       lock.lock();
       borrowedObjects.forEach((id, pooledObject) -> {
-        if ((pooledObject.isAbandoned(config.abandonedTimeout()))) {
+        if ((pooledObject.isAbandoned(now, config.abandonedTimeout()))) {
           objectsToRemove.add(pooledObject);
         }
       });
 
       for (PooledObject<T> pooledObject : objectsToRemove) {
-        log.warn("Removing abandoned object with id {} borrowed for more than {}ms and destroying it.", pooledObject.id(), pooledObject.lastBorrowedTime());
+        log.warn("Removing abandoned object with id {} borrowed for more than {} ms and destroying it.", pooledObject.id(), now - pooledObject.lastBorrowedTime());
         removeAndDestroyBorrowedObjects(pooledObject);
       }
     } catch (Exception e) {
@@ -249,14 +260,14 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    *
    * @return A pooled object of type T
    *
-   * @throws InterruptedException if the thread is interrupted while waiting
-   * @throws PoolException        if object validation fails or unable to borrow within timeout
+   * @throws PoolException if object validation fails, unable to borrow within timeout, or thread interrupted
    */
-  public T borrowObject() throws InterruptedException, PoolException {
+  public T borrowObject() throws PoolException {
     PooledObject<T> pooledObject   = null;
     boolean         acquired       = false;
     final long      startTime      = System.nanoTime();
-    long            remainingNanos = config.waitingForObjectTimeout();
+    final var       waitTimeout    = config.waitingForObjectTimeout();
+    long            remainingNanos = waitTimeout;
     int             retriesLeft    = config.maxRetries();
 
     try {
@@ -264,31 +275,38 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       if (!acquired) {
         throw new PoolTimeoutException("Timeout waiting to acquire lock to borrow object");
       }
-      remainingNanos = remainingNanos - (System.nanoTime() - startTime);
+      remainingNanos = waitTimeout - (System.nanoTime() - startTime);
       boolean createdObject = false;
-      while (remainingNanos > 0) {
+      do {
         // First try to get from idle objects
-        pooledObject = idleObjects.poll();
-
+        pooledObject  = idleObjects.poll();
+        createdObject = false;
         if (pooledObject == null) {
-          // Try to create new if pool is not full
+          // Try to create new, if pool is not full
           if (borrowedObjects.size() < config.maxPoolSize()) {
+            if (retriesLeft < 0) {
+              throw new PoolObjectException("Max retries reached while creating object and failing to borrow");
+            }
+            // Apply creation retry delay if configured only from second try
+            if (retriesLeft < config.maxRetries()) {
+              if (config.retryCreationDelay() > 0) {
+                remainingNanos -= retryCreationWait.awaitNanos(config.retryCreationDelay());
+              } else {
+                // calculate remaining time
+                remainingNanos = waitTimeout - (System.nanoTime() - startTime);
+              }
+              // happens from first retry only
+              if (remainingNanos <= 0) {
+                throw new PoolTimeoutException("Timeout waiting for object creation during borrow");
+              }
+            }
+
             try {
               pooledObject  = createObject();
               createdObject = true;
+              retriesLeft--;
             } catch (PoolObjectException | PoolObjectValidationException e) {
               log.error("Failed to create objects when borrowing", e);
-              if (retriesLeft < 1) {
-                log.error("Max retries reached while creating object and failing to borrow", e);
-                throw e;
-              }
-              // Apply creation retry delay if configured
-              if (config.retryCreationDelay() > 0) {
-                remainingNanos -= retryCreationWait.awaitNanos(config.retryCreationDelay());
-                if (remainingNanos <= 0) {
-                  throw new PoolTimeoutException("Timeout waiting for object creation during borrow");
-                }
-              }
               retriesLeft--;
               continue;
             }
@@ -320,9 +338,11 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         log.trace("Resource borrowed - id: {}, current pool size: {}",
                   pooledObject.id(), currentPoolSize.get());
         return object;
-      }
+      } while (remainingNanos > 0);
 
       throw new PoolTimeoutException("Timeout waiting for an available object to borrow");
+    } catch (InterruptedException e) {
+      throw new PoolException("Thread interrupted while attempting to borrow object", e);
     } finally {
       if (acquired) {
         lock.unlock();
@@ -364,7 +384,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       // Then perform testOnReturn validation if configured and object isn't already invalid
       if (isValid && config.testOnReturn()) {
         try {
-          isValid = factory.isObjectValidForBorrow(obj);
+          isValid = factory.isObjectValid(obj);
         } catch (Exception e) {
           log.error("Error validating object on return", e);
           isValid = false;

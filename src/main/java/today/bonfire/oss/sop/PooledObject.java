@@ -25,6 +25,7 @@ public class PooledObject<T extends PoolObject> {
    * @param id     The unique identifier to assign to this pooled entity
    */
   PooledObject(T object, Long id) {
+    Objects.requireNonNull(object, "Pool object cannot be null");
     this.object = object;
     object.setEntityId(id);
     this.creationTime = System.currentTimeMillis();
@@ -101,8 +102,8 @@ public class PooledObject<T extends PoolObject> {
    */
   void borrow() {
     borrowed = true;
-    timesBorrowed++;
     lastBorrowedTime = System.currentTimeMillis();
+    timesBorrowed++;
   }
 
   /**
@@ -121,8 +122,8 @@ public class PooledObject<T extends PoolObject> {
    * @param abandonmentTimeoutMillis The maximum allowed duration in milliseconds since the object was last borrowed.
    * @return {@code true} if the object is considered abandoned, {@code false} otherwise.
    */
-  boolean isAbandoned(long abandonmentTimeoutMillis) {
-    return borrowed && (System.currentTimeMillis() - lastBorrowedTime) >= abandonmentTimeoutMillis;
+  boolean isAbandoned(long now, long abandonmentTimeoutMillis) {
+    return borrowed && ((now - lastBorrowedTime) >= abandonmentTimeoutMillis);
   }
 
   /**
