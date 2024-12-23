@@ -1,10 +1,10 @@
 package today.bonfire.oss.sop;
 
-public class TestPoolEntity implements PoolEntity {
+public class TestPoolObject implements PoolObject {
   private Long    entityId;
   private boolean markDestroyed = false;
 
-  TestPoolEntity() {}
+  TestPoolObject() {}
 
   @Override
   public Long getEntityId() {
