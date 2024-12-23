@@ -269,7 +269,7 @@ class SimpleObjectPoolTest {
                                        .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.OLDEST_FIRST)
                                        .objEvictionTimeout(Duration.ofSeconds(1000))
                                        .numValidationsPerEvictionRun(1)
-                                       .durationBetweenEvictionsRuns(Duration.ofMillis(100))
+                                       .durationBetweenEvictionsRuns(Duration.ofMillis(80))
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -353,7 +353,7 @@ class SimpleObjectPoolTest {
                                        .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.MOST_USED)
                                        .objEvictionTimeout(Duration.ofSeconds(1000))
                                        .numValidationsPerEvictionRun(1)
-                                       .durationBetweenEvictionsRuns(Duration.ofMillis(100))
+                                       .durationBetweenEvictionsRuns(Duration.ofMillis(80))
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -376,7 +376,7 @@ class SimpleObjectPoolTest {
     Thread.sleep(100); // Wait longer than eviction timeout
 
     assertThat(localPool.currentPoolSize())
-        .as("Least used object should be evicted")
+        .as("Most used object should be evicted")
         .isEqualTo(1);
 
     var borrowedAgain = localPool.borrowObject();

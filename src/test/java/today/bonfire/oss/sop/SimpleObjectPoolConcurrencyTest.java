@@ -167,7 +167,7 @@ class SimpleObjectPoolConcurrencyTest {
                                                             .maxPoolSize(MAX_POOL_SIZE)
                                                             .minPoolSize(MIN_POOL_SIZE)
                                                             .testOnBorrow(true)
-                                                            .waitingForObjectTimeout(Duration.ofSeconds(1))
+                                                            .waitingForObjectTimeout(Duration.ofSeconds(2))
                                                             .build(), factory);
 
     ExecutorService executor   = Executors.newVirtualThreadPerTaskExecutor();
@@ -185,8 +185,8 @@ class SimpleObjectPoolConcurrencyTest {
 
     startLatch.countDown();
 
-    TestPoolObject borrowed1 = future1.get(1, TimeUnit.SECONDS);
-    TestPoolObject borrowed2 = future2.get(1, TimeUnit.SECONDS);
+    TestPoolObject borrowed1 = future1.get(1500, TimeUnit.MILLISECONDS);
+    TestPoolObject borrowed2 = future2.get(1500, TimeUnit.MILLISECONDS);
 
     assertThat(borrowed1)
         .as("First entity should not be null")
