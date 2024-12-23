@@ -339,7 +339,7 @@ public class SimpleObjectPoolConfig {
      * many cases take some time compared to simple tests.
      * <br>
      * If set to 0 then no factory validation will be done. <br>
-     * If set to null or not set then the factory validation will be limited to {@link #maxPoolSize()}
+     * If set to null or not set then the factory validation will be limited to {@link SimpleObjectPoolConfig#maxPoolSize()}
      *
      * @param numValidationsPerEvictionRun The number of objects to test per eviction run.
      * @return This {@code Builder} instance.
