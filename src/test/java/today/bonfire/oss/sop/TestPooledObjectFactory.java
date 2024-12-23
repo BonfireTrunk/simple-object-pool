@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * This factory provides real behavior instead of mocks, making tests more realistic.
  */
 @Getter @Setter
-public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolEntity> {
+public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObject> {
   private final    AtomicLong    idCounter                    = new AtomicLong(0);
   private          long          creationDelayMillis          = 0;
   private          long          destroyDelayMillis           = 0;
@@ -29,7 +29,7 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolEnti
   public TestPooledObjectFactory() {}
 
   @Override
-  public TestPoolEntity createObject() {
+  public TestPoolObject createObject() {
     if (failCreation) {
       throw new RuntimeException("Simulated creation failure");
     }
@@ -40,13 +40,17 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolEnti
         Thread.currentThread().interrupt();
       }
     }
-    TestPoolEntity entity = new TestPoolEntity();
+    TestPoolObject entity = new TestPoolObject();
     idCounter.incrementAndGet();
     return entity;
   }
 
+  @Override public void activateObject(TestPoolObject obj) {
+    // Do nothing
+  }
+
   @Override
-  public boolean isObjectValidForBorrow(TestPoolEntity obj) {
+  public boolean isObjectValidForBorrow(TestPoolObject obj) {
     if (validationDelayMillis > 0) {
       try {
         Thread.sleep(validationDelayMillis);
@@ -62,7 +66,7 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolEnti
   }
 
   @Override
-  public boolean isObjectValid(TestPoolEntity obj) {
+  public boolean isObjectValid(TestPoolObject obj) {
     if (validationDelayMillis > 0) {
       try {
         Thread.sleep(validationDelayMillis);
@@ -79,7 +83,7 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolEnti
   }
 
   @Override
-  public void destroyObject(TestPoolEntity obj) {
+  public void destroyObject(TestPoolObject obj) {
     if (destroyDelayMillis > 0) {
       try {
         Thread.sleep(destroyDelayMillis);

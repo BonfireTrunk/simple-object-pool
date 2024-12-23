@@ -3,21 +3,31 @@ package today.bonfire.oss.sop;
 /**
  * Provides a factory for creating pooled objects.
  * Implementations should provide a concrete type of T that implements the
- * {@link PoolEntity} interface.
+ * {@link PoolObject} interface.
  *
- * @param <T> the type of object to be pooled, must implement {@link PoolEntity}
+ * @param <T> the type of object to be pooled, must implement {@link PoolObject}
  */
-public interface PooledObjectFactory<T extends PoolEntity> {
+public interface PooledObjectFactory<T extends PoolObject> {
 
   /**
    * Creates an instance of the pooled object.
    * This method is responsible for instantiating and initializing
-   * a new object of type T that implements the {@link PoolEntity} interface.
+   * a new object of type T that implements the {@link PoolObject} interface.
    * Implementations should handle any exceptions gracefully.
    *
    * @return a newly created object of type T, never null.
    */
   T createObject();
+
+
+  /**
+   * Activates the pooled object.
+   * This method is called when the object is taken from the pool,
+   * and is responsible for any necessary activation or initialization setting before borrow.
+   *
+   * @param obj the object to activate, must not be null.
+   */
+  void activateObject(T obj);
 
   /**
    * Validates the pooled object to determine if it can be safely borrowed.
