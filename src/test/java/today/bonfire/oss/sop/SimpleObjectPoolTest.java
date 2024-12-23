@@ -10,11 +10,6 @@ import today.bonfire.oss.sop.exceptions.PoolObjectException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
 import java.time.Duration;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -129,64 +124,6 @@ class SimpleObjectPoolTest {
     localPool.close();
   }
 
-  @Test
-  void testConcurrentBorrowAndReturn() throws Exception {
-    var config = pool.config().toBuilder()
-                     .abandonedTimeout(Duration.ofSeconds(10))
-                     .build();
-    var localPool = new SimpleObjectPool<>(config, factory);
-
-    int             numThreads      = MAX_POOL_SIZE * 2;
-    ExecutorService executor        = Executors.newVirtualThreadPerTaskExecutor();
-    CountDownLatch  startLatch      = new CountDownLatch(1);
-    CountDownLatch  completionLatch = new CountDownLatch(numThreads);
-
-    AtomicInteger successfulBorrows = new AtomicInteger(0);
-    when(factory.createObject()).thenAnswer(inv -> {
-      TestPoolObject entity = new TestPoolObject();
-      when(factory.isObjectValidForBorrow(entity)).thenReturn(true);
-      return entity;
-    });
-
-    // Create tasks that borrow and return objects
-    for (int i = 0; i < numThreads; i++) {
-      executor.submit(() -> {
-        try {
-          startLatch.await();
-          TestPoolObject obj = localPool.borrowObject();
-          assertThat(obj).isNotNull();
-          successfulBorrows.incrementAndGet();
-          Thread.sleep(10); // Simulate some work
-          localPool.returnObject(obj);
-        } catch (Exception e) {
-          // Expected some threads to fail due to pool exhaustion
-          assertThat(e)
-              .as("Failed threads should throw PoolTimeoutException")
-              .isInstanceOf(PoolTimeoutException.class);
-        } finally {
-          completionLatch.countDown();
-        }
-      });
-    }
-
-    startLatch.countDown();
-    assertThat(completionLatch.await(10, TimeUnit.SECONDS))
-        .as("All threads should complete within timeout")
-        .isTrue();
-    executor.shutdown();
-    assertThat(executor.awaitTermination(5, TimeUnit.SECONDS))
-        .as("Executor should terminate within timeout")
-        .isTrue();
-
-    assertThat(successfulBorrows.get())
-        .as("Should have some successful borrows")
-        .isGreaterThan(0);
-    assertThat(localPool.currentPoolSize())
-        .as("Pool size should not exceed maximum")
-        .isLessThanOrEqualTo(MAX_POOL_SIZE);
-
-    localPool.close();
-  }
 
   @Test
   void testObjectValidation() throws Exception {

@@ -116,8 +116,8 @@ class SimpleObjectPoolConfigTest {
   @Test
   void validate_warningForMaxRetriesGreaterThanMaxPoolSize() {
     SimpleObjectPoolConfig.builder()
-                          .maxPoolSize(5)
-                          .maxRetries(10)
+                          .maxPoolSize(4)
+                          .maxRetries(5)
                           .build();
 
     assertThat(listAppender.list)
@@ -126,28 +126,13 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
-  void validate_warnMaxRetries_negative() {
-    SimpleObjectPoolConfig.builder().maxRetries(-1).build();
-    // Check logs for info
-    // log.info("maxRetries is negative. This means that there will be no retries.");
-  }
-
-  @Test
   void validate_warningForNegativeMaxRetries() {
-    SimpleObjectPoolConfig.builder()
-                          .maxRetries(-1)
-                          .build();
-
-    assertThat(listAppender.list)
-        .extracting(ILoggingEvent::getMessage)
-        .contains("maxRetries is negative. This means that there will be no retries.");
-  }
-
-  @Test
-  void validate_warnWaitingForObjectTimeout_negative() {
-    SimpleObjectPoolConfig.builder().waitingForObjectTimeout(Duration.ofMillis(-1)).build();
-    // Check logs for warning
-    // log.warn("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
+    assertThatThrownBy(() ->
+        SimpleObjectPoolConfig.builder()
+            .maxRetries(-1)
+            .build()
+    ).isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("maxRetries cannot be negative");
   }
 
   @Test
@@ -162,13 +147,6 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
-  void validate_warnRetryCreationDelay_negative() {
-    SimpleObjectPoolConfig.builder().retryCreationDelay(Duration.ofMillis(-1)).build();
-    // Check logs for warning
-    // log.warn("retryCreationDelay is negative. object creation retries will be immediate.");
-  }
-
-  @Test
   void validate_warningForNegativeRetryCreationDelay() {
     SimpleObjectPoolConfig.builder()
                           .retryCreationDelay(Duration.ofMillis(-1))
@@ -177,13 +155,6 @@ class SimpleObjectPoolConfigTest {
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
         .contains("retryCreationDelay is negative. object creation retries will be immediate.");
-  }
-
-  @Test
-  void validate_infoRetryCreationDelay_positive() {
-    SimpleObjectPoolConfig.builder().retryCreationDelay(Duration.ofMillis(1)).build();
-    // Check logs for info
-    // log.info("You have set a positive retryCreationDelay. This may result is a case where object borrow wait time may be as high as waitingForObjectTimeout + retryCreationDelay in case of creation failure scenario.");
   }
 
   @Test
@@ -337,16 +308,24 @@ class SimpleObjectPoolConfigTest {
   @Test
   void validate_timeoutComparisons() {
     // Test warning condition: durationBetweenEvictionsRuns <= waitingForObjectTimeout
-    SimpleObjectPoolConfig config1 = SimpleObjectPoolConfig.builder()
-                                                           .durationBetweenEvictionsRuns(Duration.ofSeconds(5))
-                                                           .waitingForObjectTimeout(Duration.ofSeconds(10))
-                                                           .build();
+    SimpleObjectPoolConfig.builder()
+                          .durationBetweenEvictionsRuns(Duration.ofSeconds(5))
+                          .waitingForObjectTimeout(Duration.ofSeconds(10))
+                          .build();
+
+    assertThat(listAppender.list)
+        .extracting(ILoggingEvent::getMessage)
+        .contains("durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
 
     // Test warning condition: abandonedTimeout <= waitingForObjectTimeout
-    SimpleObjectPoolConfig config2 = SimpleObjectPoolConfig.builder()
-                                                           .abandonedTimeout(Duration.ofSeconds(5))
-                                                           .waitingForObjectTimeout(Duration.ofSeconds(10))
-                                                           .build();
+    SimpleObjectPoolConfig.builder()
+                          .abandonedTimeout(Duration.ofSeconds(5))
+                          .waitingForObjectTimeout(Duration.ofSeconds(10))
+                          .build();
+
+    assertThat(listAppender.list)
+        .extracting(ILoggingEvent::getMessage)
+        .contains("abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
   }
 
   @Test
@@ -435,17 +414,5 @@ class SimpleObjectPoolConfigTest {
     assertThat(config.maxRetries()).isEqualTo(3);
     assertThat(config.retryCreationDelay()).isEqualTo(100000000); // 100 millis in nanos
     assertThat(config.waitingForObjectTimeout()).isEqualTo(5000000000L); // 5 seconds in nanos
-  }
-
-  @Test
-  void validate_warnMaxRetries_greaterThanMaxPoolSize() {
-    SimpleObjectPoolConfig.builder()
-                          .maxPoolSize(5)
-                          .maxRetries(10)
-                          .build();
-
-    assertThat(listAppender.list)
-        .extracting(ILoggingEvent::getMessage)
-        .contains("maxRetries is greater than maxPoolSize. This may result in excessive retries.");
   }
 }

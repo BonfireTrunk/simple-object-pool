@@ -278,7 +278,7 @@ public class SimpleObjectPoolConfig {
     /**
      * Sets whether objects should be tested while they are idle in the pool.
      *
-     * @param testWhileIdle {@code true} if objects should be tested while idle, {@code false} otherwise.
+     * @param testWhileIdle {@code true} if edle objects should be checked, {@code false} otherwise.
      * @return This {@code Builder} instance.
      */
     public Builder testWhileIdle(boolean testWhileIdle) {
@@ -322,6 +322,7 @@ public class SimpleObjectPoolConfig {
     /**
      * Sets the timeout duration for an object from its creation time to be considered for
      * eviction.
+     *
      *
      * @param objEvictionTimeout The object idle timeout duration.
      * @return This {@code Builder} instance.
@@ -435,12 +436,8 @@ public class SimpleObjectPoolConfig {
             "You have set a positive retryCreationDelay. This may result is a case where object borrow wait time may be as high as waitingForObjectTimeout + retryCreationDelay in case of creation failure scenario.");
       }
 
-      if (objEvictionTimeout.isNegative()) {
-        log.warn("objIdleTimeout is negative. This means idle objects will not be destroyed.");
-      }
-
-      if (objEvictionTimeout.isZero()) {
-        log.info("objIdleTimeout is zero. This means idle objects will be destroyed immediately.");
+      if (objEvictionTimeout.isZero() || objEvictionTimeout.isNegative()) {
+        log.info("objIdleTimeout is zero or negative. This means idle objects will be destroyed immediately.");
       }
 
       if (durationBetweenEvictionsRuns.isNegative() || durationBetweenEvictionsRuns.isZero()) {

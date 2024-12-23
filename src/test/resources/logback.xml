@@ -27,7 +27,7 @@
             <pattern>%black(%d{yyMMddHHmmss}) %highlight(%-5level) %magenta([%thread] %-16.16logger{5}) %yellow(%X{uid:-ND}) : %boldCyan(%msg%n%ex{short})</pattern>
         </encoder>
         <filter class="ThresholdFilter">
-            <level>DEBUG</level>
+            <level>TRACE</level>
         </filter>
     </appender>
 

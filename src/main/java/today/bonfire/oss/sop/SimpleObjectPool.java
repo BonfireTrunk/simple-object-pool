@@ -12,8 +12,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -31,16 +31,16 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
   private static final Logger log = org.slf4j.LoggerFactory.getLogger(SimpleObjectPool.class);
 
-  private final LinkedBlockingQueue<PooledObject<T>> idleObjects       = new LinkedBlockingQueue<>();
-  private final Map<Long, PooledObject<T>>           borrowedObjects   = new ConcurrentHashMap<>();
-  private final ScheduledExecutorService             scheduler         = Executors.newSingleThreadScheduledExecutor();
-  private final PooledObjectFactory<T>               factory;
-  private final SimpleObjectPoolConfig               config;
-  private final ReentrantLock                        lock;
-  private final Condition                            notEmpty;
-  private final Condition                            retryCreationWait;
-  private final AtomicLong                           objectCreateCount = new AtomicLong(0);
-  private final AtomicInteger                        currentPoolSize   = new AtomicInteger(0);
+  private final ConcurrentLinkedQueue<PooledObject<T>> idleObjects       = new ConcurrentLinkedQueue<>();
+  private final Map<Long, PooledObject<T>>             borrowedObjects   = new ConcurrentHashMap<>();
+  private final ScheduledExecutorService               scheduler         = Executors.newSingleThreadScheduledExecutor();
+  private final PooledObjectFactory<T>                 factory;
+  private final SimpleObjectPoolConfig                 config;
+  private final ReentrantLock                          lock;
+  private final Condition                              notEmpty;
+  private final Condition                              retryCreationWait;
+  private final AtomicLong                             objectCreateCount = new AtomicLong(0);
+  private final AtomicInteger                          currentPoolSize   = new AtomicInteger(0);
 
   public SimpleObjectPool(SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
     this.config       = config;
@@ -82,6 +82,9 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    * Evicted objects are destroyed using the objectFactory.
    */
   private void evictionRun() {
+    if (!config.testWhileIdle()) {
+      return;
+    }
     List<PooledObject<T>> objectsToDestroy = new ArrayList<>();
     // Only run eviction if we have more idle objects than minimum required
     final var size = idleObjects.size();
@@ -124,7 +127,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         // Check if object is idle for too long
         if (pooledObject.idlingTime() > config.objEvictionTimeout()) {
           shouldEvict = true;
-        } else if (config.testWhileIdle()) {
+        } else {
           if (numToTest <= 0) break;
           try {
             numToTest--;
@@ -375,20 +378,22 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       throw new PoolException("Cannot return null object to pool");
     }
 
-    var pooledEntity = borrowedObjects.get(obj.getEntityId());
+    T objectToDestroy = null;
 
-    if (pooledEntity == null) {
-      log.error("Attempted returning object that is not in borrowed objects list. id: {}", obj.getEntityId());
-      factory.destroyObject(obj);
-      return;
-    }
-
-    if (broken) {
-      pooledEntity.broken(true);
-    }
-
-    lock.lock();
     try {
+      lock.lock();
+      var notInBorrowedObjects = false;
+      var pooledEntity         = borrowedObjects.get(obj.getEntityId());
+      if (pooledEntity == null) {
+        log.error("Attempted returning object that is not in borrowed objects list. id: {}", obj.getEntityId());
+        notInBorrowedObjects = true;
+        return;
+      }
+
+
+      if (broken) {
+        pooledEntity.broken(true);
+      }
       // First check if object is broken
       boolean isValid = !pooledEntity.isBroken();
 
