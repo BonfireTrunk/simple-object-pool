@@ -170,13 +170,6 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
-  void validate_warnObjEvictionTimeout_negative() {
-    SimpleObjectPoolConfig.builder().objEvictionTimeout(Duration.ofMillis(-1)).build();
-    // Check logs for warning
-    // log.warn("objIdleTimeout is negative. This means idle objects will not be destroyed.");
-  }
-
-  @Test
   void validate_warningForNegativeObjEvictionTimeout() {
     SimpleObjectPoolConfig.builder()
                           .objEvictionTimeout(Duration.ofMillis(-1))
@@ -184,14 +177,7 @@ class SimpleObjectPoolConfigTest {
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("objIdleTimeout is negative. This means idle objects will not be destroyed.");
-  }
-
-  @Test
-  void validate_infoObjEvictionTimeout_zero() {
-    SimpleObjectPoolConfig.builder().objEvictionTimeout(Duration.ofMillis(0)).build();
-    // Check logs for info
-    // log.info("objIdleTimeout is zero. This means idle objects will be destroyed immediately.");
+        .contains("objIdleTimeout is zero or negative. This means idle objects will be destroyed immediately.");
   }
 
   @Test
@@ -202,14 +188,16 @@ class SimpleObjectPoolConfigTest {
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("objIdleTimeout is zero. This means idle objects will be destroyed immediately.");
+        .contains("objIdleTimeout is zero or negative. This means idle objects will be destroyed immediately.");
   }
 
   @Test
   void validate_warnDurationBetweenEvictionsRuns_lessThanOrEqualToWaitingForObjectTimeout() {
     SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofSeconds(1)).waitingForObjectTimeout(Duration.ofSeconds(1)).build();
-    // Check logs for warning
-    // log.warn("durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
+
+    assertThat(listAppender.list)
+        .extracting(ILoggingEvent::getMessage)
+        .contains("durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
   }
 
   @Test

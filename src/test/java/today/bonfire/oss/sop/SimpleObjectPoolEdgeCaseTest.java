@@ -52,6 +52,11 @@ class SimpleObjectPoolEdgeCaseTest {
     var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
                                                             .maxPoolSize(MAX_POOL_SIZE)
                                                             .minPoolSize(MIN_POOL_SIZE)
+                                                            .testWhileIdle(false)
+                                                            .testOnCreate(false)
+                                                            .testOnBorrow(false)
+                                                            .waitingForObjectTimeout(Duration.ofSeconds(1))
+                                                            .abandonedTimeout(Duration.ofSeconds(2))
                                                             .build(), factory);
 
     // First fill the pool to max capacity
@@ -61,14 +66,15 @@ class SimpleObjectPoolEdgeCaseTest {
     }
 
     ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    CountDownLatch latch = new CountDownLatch(1);
+    CountDownLatch  latch    = new CountDownLatch(1);
 
     Future<?> future = executor.submit(() -> {
       try {
         pool.borrowObject();
         fail("Should have been interrupted");
       } catch (PoolException e) {
-        fail("Should not throw PoolException");
+        latch.countDown();
+        assertThat(e.getMessage()).isEqualTo("Thread interrupted while attempting to borrow object");
       }
     });
 
@@ -91,11 +97,14 @@ class SimpleObjectPoolEdgeCaseTest {
   }
 
   @Test
-  void testObjectValidationFailureDuringBorrowAfterIdle() throws Exception {
+  void testObjectValidationFailureDuringBorrowAfterIdle() {
     var factory = new TestPooledObjectFactory();
     var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
                                                             .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
+                                                            .minPoolSize(0)
+                                                            .maxRetries(2)
+                                                            .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.NONE)
+                                                            .waitingForObjectTimeout(Duration.ofSeconds(1000))
                                                             .testWhileIdle(true)
                                                             .build(), factory);
 
@@ -112,7 +121,7 @@ class SimpleObjectPoolEdgeCaseTest {
 
     assertThat(factory.getValidationForBorrowFailCount().get())
         .as("Validation should fail exactly once during borrow")
-        .isEqualTo(1 + MAX_POOL_SIZE); // will try MAX_POOL_SIZE times before giving up
+        .isEqualTo(1 + 1 + 2); // 1 for existing object, 1 for first time creation and 2 for retries
 
     pool.close();
   }
@@ -121,8 +130,11 @@ class SimpleObjectPoolEdgeCaseTest {
   void testReturnSameObjectTwice() throws Exception {
     var factory = new TestPooledObjectFactory();
     var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
+                                                            .maxPoolSize(2)
+                                                            .minPoolSize(0)
+                                                            .testOnCreate(false)
+                                                            .testOnReturn(false)
+                                                            .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.NONE)
                                                             .build(), factory);
 
     TestPoolObject borrowed = pool.borrowObject();

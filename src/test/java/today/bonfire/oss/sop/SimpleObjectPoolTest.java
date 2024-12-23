@@ -198,10 +198,11 @@ class SimpleObjectPoolTest {
     // Create a pool with timeouts less than MIN_TIMEOUT_MS (10ms)
     var config = SimpleObjectPoolConfig.builder()
                                        .testOnReturn(false)
+                                       .testWhileIdle(false)
                                        .waitingForObjectTimeout(Duration.ofMillis(10))
-                                       .abandonedTimeout(Duration.ofMillis(20))
+                                       .abandonedTimeout(Duration.ofMillis(200))
                                        .durationBetweenAbandonCheckRuns(Duration.ofMillis(5))
-                                       .objEvictionTimeout(Duration.ofMillis(10))
+                                       .objEvictionTimeout(Duration.ofMillis(20))
                                        .durationBetweenEvictionsRuns(Duration.ofMillis(10))
                                        .build();
     pool = new SimpleObjectPool<>(config, factory);
@@ -310,7 +311,7 @@ class SimpleObjectPoolTest {
                                        .maxPoolSize(2)
                                        .minPoolSize(0)
                                        .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.LEAST_USED)
-                                       .objEvictionTimeout(Duration.ofSeconds(1000))
+                                       .objEvictionTimeout(Duration.ofMinutes(1))
                                        .numValidationsPerEvictionRun(1)
                                        .durationBetweenEvictionsRuns(Duration.ofMillis(100))
                                        .build();

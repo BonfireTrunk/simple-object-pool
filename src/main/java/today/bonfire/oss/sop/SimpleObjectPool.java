@@ -82,7 +82,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    * Evicted objects are destroyed using the objectFactory.
    */
   private void evictionRun() {
-    if (!config.testWhileIdle()) {
+    if (config.evictionPolicy() == SimpleObjectPoolConfig.EvictionPolicy.NONE) {
       return;
     }
     List<PooledObject<T>> objectsToDestroy = new ArrayList<>();
@@ -127,7 +127,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         // Check if object is idle for too long
         if (pooledObject.idlingTime() > config.objEvictionTimeout()) {
           shouldEvict = true;
-        } else {
+        } else if (config.testWhileIdle()) {
           if (numToTest <= 0) break;
           try {
             numToTest--;
@@ -378,19 +378,13 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       throw new PoolException("Cannot return null object to pool");
     }
 
-    T objectToDestroy = null;
-
     try {
       lock.lock();
-      var notInBorrowedObjects = false;
-      var pooledEntity         = borrowedObjects.get(obj.getEntityId());
+      var pooledEntity = borrowedObjects.get(obj.getEntityId());
       if (pooledEntity == null) {
-        log.error("Attempted returning object that is not in borrowed objects list. id: {}", obj.getEntityId());
-        notInBorrowedObjects = true;
+        log.warn("Attempted returning object that is not in borrowed objects list. id: {}", obj.getEntityId());
         return;
       }
-
-
       if (broken) {
         pooledEntity.broken(true);
       }
@@ -414,7 +408,6 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
         borrowedObjects.remove(pooledEntity.id());
         pooledEntity.markIdle();
-        // Add to front of queue for faster reuse
         idleObjects.add(pooledEntity);
         log.trace("Object returned - id: {}, current pool size: {}",
                   pooledEntity.id(), currentPoolSize.get());
@@ -426,6 +419,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     } finally {
       lock.unlock();
     }
+
   }
 
   /**

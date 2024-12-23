@@ -17,7 +17,8 @@ public interface PoolObject {
   /**
    * Sets the unique identifier for this entity.
    * This method should only be called by the {@link SimpleObjectPool} implementation.
-   * Directly setting this value may lead to unexpected behavior.
+   * Directly setting this value may lead to unexpected behavior. 
+   * Implementations should throw an {@link IllegalStateException} if the entity ID is already set as it is not allowed to change.
    * <p>
    * Example:
    * <pre>{@code
@@ -31,6 +32,9 @@ public interface PoolObject {
    *
    *   @Override
    *   public void setEntityId(Long entityIdValue) {
+   *     if (this.entityId != null) {
+   *       throw new IllegalStateException("Entity ID already set");
+   *     }
    *     this.entityId = entityIdValue;
    *   }
    * }

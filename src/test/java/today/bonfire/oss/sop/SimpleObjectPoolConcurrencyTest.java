@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -59,7 +60,7 @@ class SimpleObjectPoolConcurrencyTest {
   @Test
   void testConcurrentBorrowAndReturn() throws Exception {
     var config = pool.config().toBuilder()
-        .maxPoolSize(MAX_POOL_SIZE)
+                     .maxPoolSize(MAX_POOL_SIZE)
                      .abandonedTimeout(Duration.ofSeconds(10))
                      .build();
     var localPool = new SimpleObjectPool<>(config, factory);
@@ -160,30 +161,32 @@ class SimpleObjectPoolConcurrencyTest {
   @Test
   void testConcurrentBorrowWithSlowValidation() throws Exception {
     var factory = new TestPooledObjectFactory();
-    factory.setValidationDelayMillis(300); // 300ms validation delay
+    factory.setValidationDelayMillis(500); // 500ms validation delay
 
     var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
                                                             .maxPoolSize(MAX_POOL_SIZE)
                                                             .minPoolSize(MIN_POOL_SIZE)
+                                                            .testOnBorrow(true)
+                                                            .waitingForObjectTimeout(Duration.ofSeconds(1))
                                                             .build(), factory);
 
     ExecutorService executor   = Executors.newVirtualThreadPerTaskExecutor();
     CountDownLatch  startLatch = new CountDownLatch(1);
 
-    java.util.concurrent.Future<TestPoolObject> future1 = executor.submit(() -> {
+    Future<TestPoolObject> future1 = executor.submit(() -> {
       startLatch.await();
       return pool.borrowObject();
     });
 
-    java.util.concurrent.Future<TestPoolObject> future2 = executor.submit(() -> {
+    Future<TestPoolObject> future2 = executor.submit(() -> {
       startLatch.await();
       return pool.borrowObject();
     });
 
     startLatch.countDown();
 
-    TestPoolObject borrowed1 = future1.get(3, TimeUnit.SECONDS);
-    TestPoolObject borrowed2 = future2.get(3, TimeUnit.SECONDS);
+    TestPoolObject borrowed1 = future1.get(1, TimeUnit.SECONDS);
+    TestPoolObject borrowed2 = future2.get(1, TimeUnit.SECONDS);
 
     assertThat(borrowed1)
         .as("First entity should not be null")

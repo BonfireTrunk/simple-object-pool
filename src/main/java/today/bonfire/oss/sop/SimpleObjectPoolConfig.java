@@ -184,7 +184,8 @@ public class SimpleObjectPoolConfig {
     OLDEST_FIRST,
     LEAST_USED,
     MOST_USED,
-    RANDOM // Default fastest
+    RANDOM, // Default fastest
+    NONE
   }
 
   /**
@@ -276,9 +277,9 @@ public class SimpleObjectPoolConfig {
     }
 
     /**
-     * Sets whether objects should be tested while they are idle in the pool.
+     * Sets whether objects should be tested for validity while they are idle in the pool.
      *
-     * @param testWhileIdle {@code true} if edle objects should be checked, {@code false} otherwise.
+     * @param testWhileIdle {@code true} if idle objects should be tested, {@code false} otherwise.
      * @return This {@code Builder} instance.
      */
     public Builder testWhileIdle(boolean testWhileIdle) {
@@ -322,7 +323,6 @@ public class SimpleObjectPoolConfig {
     /**
      * Sets the timeout duration for an object from its creation time to be considered for
      * eviction.
-     *
      *
      * @param objEvictionTimeout The object idle timeout duration.
      * @return This {@code Builder} instance.
