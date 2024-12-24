@@ -171,7 +171,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     }
 
     if (!objectsToDestroy.isEmpty()) {
-      log.info("Evicted {} idle objects. Current pool size: {}, Idle: {}, Borrowed: {}",
+      log.debug("Evicted {} idle objects. Current pool size: {}, Idle: {}, Borrowed: {}",
                objectsToDestroy.size(), currentPoolSize(), idleObjectCount(), borrowedObjectsCount());
       objectsToDestroy.clear();
     }
@@ -406,6 +406,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         log.warn("Returned broken or invalid entity with id {} and destroyed it.", pooledEntity.id());
       } else {
 
+        factory.passivateObject(obj);
         borrowedObjects.remove(pooledEntity.id());
         pooledEntity.markIdle();
         idleObjects.add(pooledEntity);
@@ -441,7 +442,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   @Override
   public void close() {
     if (!scheduler.isShutdown()) {
-      log.info("Closing object pool");
+      log.info("Closing object pool. Current pool size: {}", currentPoolSize.get());
       scheduler.shutdown();
     } else {
       log.warn("Trying to close an Object pool that is already closed");
