@@ -29,6 +29,16 @@ public interface PooledObjectFactory<T extends PoolObject> {
    */
   void activateObject(T obj);
 
+
+  /**
+   * Passivates the pooled object.
+   * This method is called when the object is being returned to the pool,
+   * and is responsible for any necessary passivation or cleaning-up before returning to pool.
+   *
+   * @param obj the object to passivate, must not be null.
+   */
+  void passivateObject(T obj);
+
   /**
    * Validates the pooled object to determine if it can be safely borrowed.
    * This method should return true if the object is in a valid state for

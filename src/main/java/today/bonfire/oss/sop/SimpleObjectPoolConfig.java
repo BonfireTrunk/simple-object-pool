@@ -133,7 +133,7 @@ public class SimpleObjectPoolConfig {
    */
   private final long waitingForObjectTimeout;
 
-  private SimpleObjectPoolConfig(Builder builder) {
+  protected SimpleObjectPoolConfig(Builder builder) {
     this.maxPoolSize                     = builder.maxPoolSize;
     this.minPoolSize                     = builder.minPoolSize;
     this.fairness                        = builder.fairness;
@@ -195,7 +195,7 @@ public class SimpleObjectPoolConfig {
   public static class Builder {
     private int            maxPoolSize                     = 8;
     private int            minPoolSize                     = 0;
-    private boolean        fairness                        = true;
+    private boolean        fairness                        = false;
     private boolean        testOnCreate                    = false;
     private boolean        testOnBorrow                    = true;
     private boolean        testOnReturn                    = false;
@@ -223,6 +223,9 @@ public class SimpleObjectPoolConfig {
 
     /**
      * Sets the minimum number of objects that the pool should maintain.
+     * Note setting a positive value does not guarantee that the pool will have at least the specified number
+     * of objects rather it suggests that the pool should attempt to maintain the specified number of objects.
+     * Especially in case of evictionsruns the pool may not be able to maintain the specified number of objects.
      *
      * @param minPoolSize The minimum pool size.
      * @return This {@code Builder} instance.
@@ -323,6 +326,12 @@ public class SimpleObjectPoolConfig {
     /**
      * Sets the timeout duration for an object from its creation time to be considered for
      * eviction.
+     * <br>
+     * If set to 0 then eviction will be immediate.
+     * <p>
+     * Note: if you want eviction only based on object validation then set
+     * this to a very high value in the range of hours or days.
+     * </p>
      *
      * @param objEvictionTimeout The object idle timeout duration.
      * @return This {@code Builder} instance.
@@ -389,6 +398,13 @@ public class SimpleObjectPoolConfig {
 
     /**
      * Sets the timeout duration for waiting for an object to become available in the pool.
+     * The default value is 10 seconds if not set.
+     * <p>
+     * If the timeout is set to 0 or negative values then the pool will not wait for an object to become available if the pool is empty
+     * but will throw an exception instead.
+     * <p>
+     * if you want to wait indefinitely then use a very large value in the range of hours or days.
+     * Setting a very high value is not recommended, rather handle the cases with much shorter timeouts.
      *
      * @param waitingForObjectTimeout The waiting for object timeout duration.
      * @return This {@code Builder} instance.
@@ -404,7 +420,7 @@ public class SimpleObjectPoolConfig {
      * This method will throw an exception if any of the configuration settings are invalid.
      * It will also log warnings if any of the settings may result in unexpected behavior.
      */
-    public void validate() {
+    protected void validate() {
       if (maxPoolSize < 1) {
         throw new IllegalArgumentException("maxPoolSize must be greater than 0");
       }
@@ -466,7 +482,7 @@ public class SimpleObjectPoolConfig {
 
     }
 
-    public SimpleObjectPoolConfig build() {
+    protected Builder prepareAndCheck() {
       if (numValidationsPerEvictionRun == null) {
         numValidationsPerEvictionRun = maxPoolSize;
       }
@@ -476,9 +492,13 @@ public class SimpleObjectPoolConfig {
           maxRetries = 1;
         }
       }
-      SimpleObjectPoolConfig config = new SimpleObjectPoolConfig(this);
       validate();
-      return config;
+      return this;
+    }
+
+    public SimpleObjectPoolConfig build() {
+      prepareAndCheck();
+      return new SimpleObjectPoolConfig(this);
     }
   }
 }
