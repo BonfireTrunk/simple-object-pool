@@ -49,6 +49,10 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObje
     // Do nothing
   }
 
+  @Override public void passivateObject(TestPoolObject obj) {
+    // Do nothing
+  }
+
   @Override
   public boolean isObjectValidForBorrow(TestPoolObject obj) {
     if (validationDelayMillis > 0) {
