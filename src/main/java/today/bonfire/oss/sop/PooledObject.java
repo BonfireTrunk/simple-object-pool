@@ -18,7 +18,7 @@ public class PooledObject<T extends PoolObject> {
   private          long timesBorrowed;
 
   /**
-   * Creates a new PooledEntity wrapping the given object with a specified ID.
+   * Creates a new PooledObject wrapping the given object with a specified ID.
    * Initializes the object in an idle, non-broken state with current timestamp.
    *
    * @param object The object to be pooled

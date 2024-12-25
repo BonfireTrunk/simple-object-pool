@@ -41,6 +41,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private final Condition                              retryCreationWait;
   private final AtomicLong                             objectCreateCount = new AtomicLong(0);
   private final AtomicInteger                          currentPoolSize   = new AtomicInteger(0);
+  private final AtomicLong timesBorrowed = new AtomicLong(0);
 
   public SimpleObjectPool(SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
     this.config       = config;
@@ -172,7 +173,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
     if (!objectsToDestroy.isEmpty()) {
       log.debug("Evicted {} idle objects. Current pool size: {}, Idle: {}, Borrowed: {}",
-               objectsToDestroy.size(), currentPoolSize(), idleObjectCount(), borrowedObjectsCount());
+                objectsToDestroy.size(), currentPoolSize(), idleObjectCount(), borrowedObjectsCount());
       objectsToDestroy.clear();
     }
   }
@@ -256,7 +257,8 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     try {
       pooledObject = new PooledObject<>(factory.createObject(), objectCreateCount.incrementAndGet());
     } catch (Exception e) {
-      throw new PoolObjectException("Failed to create object", e);
+      log.error("Failed to create object for the pool: {}", e.getMessage());
+      throw e;
     }
     if (config.testOnCreate()) {
       if (!factory.isObjectValid(pooledObject.object())) {
@@ -319,9 +321,15 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
               pooledObject  = createObject();
               createdObject = true;
               retriesLeft--;
-            } catch (PoolObjectException | PoolObjectValidationException e) {
-              log.error("Failed to create objects when borrowing", e);
+            } catch (Exception e) {
+              if (e instanceof PoolObjectValidationException) {
+                log.error("", e);
+              }
               retriesLeft--;
+              if (retriesLeft < 0) {
+                // we have exhausted retries and throw the actual exception so that the caller can handle it
+                throw e;
+              }
               continue;
             }
           }
@@ -343,11 +351,13 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           continue;
         }
 
+
         // Object is valid, prepare for borrowing
         pooledObject.borrow();
         factory.activateObject(object);
         borrowedObjects.put(pooledObject.id(), pooledObject);
         if (createdObject) currentPoolSize.incrementAndGet();
+        timesBorrowed.incrementAndGet();
         notEmpty.signal();
         log.trace("Resource borrowed - id: {}, current pool size: {}",
                   pooledObject.id(), currentPoolSize.get());
@@ -380,16 +390,16 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
     try {
       lock.lock();
-      var pooledEntity = borrowedObjects.get(obj.getEntityId());
-      if (pooledEntity == null) {
+      var pooledObject = borrowedObjects.get(obj.getEntityId());
+      if (pooledObject == null) {
         log.warn("Attempted returning object that is not in borrowed objects list. id: {}", obj.getEntityId());
         return;
       }
       if (broken) {
-        pooledEntity.broken(true);
+        pooledObject.broken(true);
       }
       // First check if object is broken
-      boolean isValid = !pooledEntity.isBroken();
+      boolean isValid = !pooledObject.isBroken();
 
       // Then perform testOnReturn validation if configured and object isn't already invalid
       if (isValid && config.testOnReturn()) {
@@ -397,26 +407,26 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           isValid = factory.isObjectValid(obj);
         } catch (Exception e) {
           log.error("Error validating object on return", e);
+          // exception is swallowed since object is already invalid and will be destroyed.
           isValid = false;
         }
       }
 
       if (!isValid) {
-        removeAndDestroyBorrowedObjects(pooledEntity);
-        log.warn("Returned broken or invalid entity with id {} and destroyed it.", pooledEntity.id());
+        log.warn("Returned broken or invalid entity with id {} and destroying it.", pooledObject.id());
+        removeAndDestroyBorrowedObjects(pooledObject);
       } else {
 
         factory.passivateObject(obj);
-        borrowedObjects.remove(pooledEntity.id());
-        pooledEntity.markIdle();
-        idleObjects.add(pooledEntity);
+        borrowedObjects.remove(pooledObject.id());
+        pooledObject.markIdle();
+        idleObjects.add(pooledObject);
         log.trace("Object returned - id: {}, current pool size: {}",
-                  pooledEntity.id(), currentPoolSize.get());
+                  pooledObject.id(), currentPoolSize.get());
         notEmpty.signal();
       }
     } catch (Exception e) {
-      log.error("Error returning object to pool", e);
-      throw new PoolObjectException("Failed to return object to pool", e);
+      throw new PoolObjectException("Unable to properly return object back to pool", e);
     } finally {
       lock.unlock();
     }
@@ -529,5 +539,44 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    */
   public int waitingCount() {
     return lock.getQueueLength();
+  }
+
+
+  /**
+   * Returns the total number of times objects have been borrowed from this pool
+   * since its creation.
+   *
+   * @return the total number of times objects have been borrowed
+   */
+  public long numOfTimesBorrowedFromPool() {
+    return timesBorrowed.get();
+  }
+
+
+  /**
+   * Returns the number of times a specific object has been borrowed from the pool
+   * since its creation.
+   * <p>
+   * Note that this method will only return statistics for objects that are currently
+   * borrowed from the pool. For objects that are idle this will have to iterate and will have a delay.
+   * If you need to check, check only for borrowed objects.
+   *
+   * @param objectId the id of the object to query, may be null
+   * @return the number of times the object has been borrowed
+   */
+  public long numOfTimesBorrowed(Long objectId) {
+    if (objectId == null) return 0;
+    var pooledObject = borrowedObjects.get(objectId);
+    if (pooledObject == null) {
+      log.warn("Object with id {} not found in borrowed objects", objectId);
+      pooledObject = idleObjects.stream()
+                                .filter(pooledObject1 -> pooledObject1.id().equals(objectId))
+                                .findAny().orElse(null);
+    }
+    if (pooledObject == null) {
+      log.warn("Object with id {} not found in idle objects", objectId);
+      return 0;
+    }
+    return pooledObject.timesBorrowed();
   }
 }
