@@ -5,7 +5,6 @@ import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
@@ -16,7 +15,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class SimpleObjectPoolConfigTest {
 
-  private static final Logger                      log = LoggerFactory.getLogger(SimpleObjectPoolConfig.class);
+  private static final org.slf4j.Logger log = LoggerFactory.getLogger(SimpleObjectPoolConfig.class);
   private              ListAppender<ILoggingEvent> listAppender;
 
   @BeforeEach
