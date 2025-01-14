@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.UUID;
 
 /**
  * {@code SimpleObjectPoolConfig} provides the configuration settings for a {@link SimpleObjectPool}.
@@ -198,7 +199,7 @@ public class SimpleObjectPoolConfig {
    * It allows for a flexible and readable configuration setup.
    */
   public static class Builder {
-    private String         poolName;
+    private String         poolName                        = "SOP-" + UUID.randomUUID().toString().substring(28).toUpperCase();
     private int            maxPoolSize                     = 8;
     private int            minPoolSize                     = 0;
     private boolean        fairness                        = false;

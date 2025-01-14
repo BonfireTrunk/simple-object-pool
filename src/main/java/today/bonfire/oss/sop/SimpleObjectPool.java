@@ -136,7 +136,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
               shouldEvict = true;
             }
           } catch (Exception e) {
-            log.warn("Object validation failed with error for object with id {}", pooledObject.id(), e);
+            log.warn("Object validation failed with error for object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
             shouldEvict = true;
           }
         }
@@ -167,13 +167,13 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
                   "used {} time(s), ",
                   pooledObject.id(), Duration.ofMillis(System.currentTimeMillis() - pooledObject.creationTime()), pooledObject.idlingTime(), pooledObject.borrowCount());
       } catch (Exception e) {
-        log.warn("Failed to destroy object with id {}", pooledObject.id(), e);
+        log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
       }
     }
 
     if (!objectsToDestroy.isEmpty()) {
-      log.debug("Evicted {} idle objects. Current pool size: {}, Idle: {}, Borrowed: {}",
-                objectsToDestroy.size(), currentPoolSize(), idleObjectCount(), borrowedObjectsCount());
+      log.debug("Evicted {} idle objects in pool - {}. Current pool size: {}, Idle: {}, Borrowed: {}",
+                objectsToDestroy.size(), config.poolName(), currentPoolSize(), idleObjectCount(), borrowedObjectsCount());
       objectsToDestroy.clear();
     }
   }
@@ -197,7 +197,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         try {
           factory.destroyObject(pooledObject.object());
         } catch (Exception e) {
-          log.warn("Failed to destroy object with id {}", pooledObject.id(), e);
+          log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
         }
       }
       log.info("Destroyed {} idle objects. Current pool size: {}",
@@ -226,11 +226,11 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       });
 
       for (PooledObject<T> pooledObject : objectsToRemove) {
-        log.warn("Removing abandoned object with id {} borrowed for more than {} ms and destroying it.", pooledObject.id(), now - pooledObject.lastBorrowedTime());
+        log.warn("Removing abandoned object with id {} in pool - {}. It has been borrowed for more than {} ms and destroying it.", pooledObject.id(), config.poolName(), now - pooledObject.lastBorrowedTime());
         removeAndDestroyBorrowedObjects(pooledObject);
       }
     } catch (Exception e) {
-      log.warn("Error removing abandoned objects", e);
+      log.warn("Error removing abandoned objects in pool - {}", config.poolName(), e);
     } finally {
       lock.unlock();
     }
@@ -248,7 +248,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     try {
       factory.destroyObject(pooledObject.object());
     } catch (Exception e) {
-      log.warn("Failed to destroy object with id {}", pooledObject.id(), e.getCause());
+      log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e.getCause());
     }
   }
 
@@ -392,7 +392,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       lock.lock();
       var pooledObject = borrowedObjects.get(obj.getEntityId());
       if (pooledObject == null) {
-        log.warn("Attempted returning object that is not in borrowed objects list. id: {}", obj.getEntityId());
+        log.warn("Attempted returning object that is not in borrowed objects list. id: {}, pool - {}", obj.getEntityId(), config.poolName());
         return;
       }
       if (broken) {
@@ -413,7 +413,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       }
 
       if (!isValid) {
-        log.warn("Returned broken or invalid entity with id {} and destroying it.", pooledObject.id());
+        log.warn("Returned broken or invalid entity with id {} to pool - {} and destroying it.", pooledObject.id(), config.poolName());
         removeAndDestroyBorrowedObjects(pooledObject);
       } else {
 
@@ -452,10 +452,10 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   @Override
   public void close() {
     if (!scheduler.isShutdown()) {
-      log.info("Closing object pool. Current pool size: {}", currentPoolSize.get());
+      log.info("Closing object pool - {}. Current pool size: {}", config.poolName(), currentPoolSize.get());
       scheduler.shutdown();
     } else {
-      log.warn("Trying to close an Object pool that is already closed");
+      log.warn("Trying to close an Object pool - {} that is already closed", config.poolName());
       return;
     }
 
@@ -477,6 +477,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       // Clear collections
       borrowedObjects.clear();
       idleObjects.clear();
+      log.info("Closed object pool - {}", config.poolName());
     } finally {
       lock.unlock();
     }
