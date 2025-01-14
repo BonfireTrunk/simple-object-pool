@@ -41,7 +41,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private final Condition                              retryCreationWait;
   private final AtomicLong                             objectCreateCount = new AtomicLong(0);
   private final AtomicInteger                          currentPoolSize   = new AtomicInteger(0);
-  private final AtomicLong timesBorrowed = new AtomicLong(0);
+  private final AtomicLong                             timesBorrowed     = new AtomicLong(0);
 
   public SimpleObjectPool(SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
     this.config       = config;
@@ -52,7 +52,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
     scheduler.scheduleAtFixedRate(this::evictionRun, config.durationBetweenEvictionsRuns(), config.durationBetweenEvictionsRuns(), TimeUnit.MILLISECONDS);
     scheduler.scheduleAtFixedRate(this::abandonCheckRun, config.durationBetweenAbandonCheckRuns(), config.durationBetweenAbandonCheckRuns(), TimeUnit.MILLISECONDS);
-    log.info("Object pool created with maxPoolSize: {}, minPoolSize: {}", config.maxPoolSize(), config.minPoolSize());
+    log.info("Pool - {} created with maxPoolSize: {}, minPoolSize: {}", config.poolName(), config.maxPoolSize(), config.minPoolSize());
     if (config.minPoolSize() > 0) {
       for (int i = 0; i < config.minPoolSize(); i++) {
         idleObjects.add(createObject());
