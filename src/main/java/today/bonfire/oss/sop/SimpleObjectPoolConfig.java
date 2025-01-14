@@ -3,6 +3,7 @@ package today.bonfire.oss.sop;
 import lombok.Getter;
 import lombok.experimental.Accessors;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 
@@ -18,7 +19,10 @@ import java.time.Duration;
 @Getter @Accessors(fluent = true)
 public class SimpleObjectPoolConfig {
 
-  private static final Logger log = org.slf4j.LoggerFactory.getLogger(SimpleObjectPoolConfig.class);
+  private static final Logger log = LoggerFactory.getLogger(SimpleObjectPoolConfig.class);
+
+
+  private final String poolName;
 
   /**
    * Returns the maximum number of objects that the pool can hold.
@@ -150,6 +154,7 @@ public class SimpleObjectPoolConfig {
     this.maxRetries                      = builder.maxRetries;
     this.retryCreationDelay              = builder.retryCreationDelay.toNanos();
     this.waitingForObjectTimeout         = builder.waitingForObjectTimeout.toNanos();
+    poolName                             = builder.poolName;
   }
 
   public static Builder builder() {
@@ -193,6 +198,7 @@ public class SimpleObjectPoolConfig {
    * It allows for a flexible and readable configuration setup.
    */
   public static class Builder {
+    private String         poolName;
     private int            maxPoolSize                     = 8;
     private int            minPoolSize                     = 0;
     private boolean        fairness                        = false;
@@ -209,6 +215,20 @@ public class SimpleObjectPoolConfig {
     private Integer        maxRetries                      = null;
     private Duration       retryCreationDelay              = Duration.ZERO;
     private Duration       waitingForObjectTimeout         = Duration.ofSeconds(10);
+
+
+    /**
+     * Sets the name of the pool.
+     * <p>
+     * The name is used for logging and debugging purposes.
+     *
+     * @param poolName The name of the pool.
+     * @return This {@code Builder} instance.
+     */
+    public Builder poolName(String poolName) {
+      this.poolName = poolName;
+      return this;
+    }
 
     /**
      * Sets the maximum number of objects that the pool can hold.
@@ -348,7 +368,7 @@ public class SimpleObjectPoolConfig {
      * many cases take some time compared to simple tests.
      * <br>
      * If set to 0 then no factory validation will be done. <br>
-     * If set to null or not set then the factory validation will be limited to {@link SimpleObjectPoolConfig#maxPoolSize()}
+     * If set to null or not set then the factory validation will be limited to {@link SimpleObjectPoolConfig#maxPoolSize}
      *
      * @param numValidationsPerEvictionRun The number of objects to test per eviction run.
      * @return This {@code Builder} instance.
