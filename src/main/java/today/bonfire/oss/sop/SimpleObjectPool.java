@@ -165,7 +165,9 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
                   "created {} ago, " +
                   "idling for {}ms " +
                   "used {} time(s), ",
-                  pooledObject.id(), Duration.ofMillis(System.currentTimeMillis() - pooledObject.creationTime()), pooledObject.idlingTime(), pooledObject.borrowCount());
+                  pooledObject.id(),
+                  Duration.ofMillis(System.currentTimeMillis() - pooledObject.creationTime()),
+                  pooledObject.idlingTime(), pooledObject.borrowCount());
       } catch (Exception e) {
         log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
       }
