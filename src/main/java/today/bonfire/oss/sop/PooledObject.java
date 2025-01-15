@@ -10,12 +10,12 @@ import java.util.Objects;
  */
 public class PooledObject<T extends PoolObject> {
   private final    T       object;
-  private final    long creationTime;
-  private volatile long lastBorrowedTime;
-  private volatile long idleFromTime;
+  private final    long    creationTime;
+  private volatile long    lastBorrowedTime;
+  private volatile long    idleFromTime;
   private volatile boolean broken;
   private volatile boolean borrowed;
-  private          long timesBorrowed;
+  private          long    timesBorrowed;
 
   /**
    * Creates a new PooledObject wrapping the given object with a specified ID.
@@ -29,6 +29,7 @@ public class PooledObject<T extends PoolObject> {
     this.object = object;
     object.setEntityId(id);
     this.creationTime = System.currentTimeMillis();
+    this.idleFromTime = this.creationTime;
     this.borrowed     = false;
     this.broken       = false;  // Initialize broken state
   }
@@ -101,7 +102,7 @@ public class PooledObject<T extends PoolObject> {
    * This method should be called when the object is taken from the pool.
    */
   void borrow() {
-    borrowed = true;
+    borrowed         = true;
     lastBorrowedTime = System.currentTimeMillis();
     timesBorrowed++;
   }
