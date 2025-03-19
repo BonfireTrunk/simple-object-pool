@@ -155,7 +155,7 @@ public class SimpleObjectPoolConfig {
     this.maxRetries                      = builder.maxRetries;
     this.retryCreationDelay              = builder.retryCreationDelay.toNanos();
     this.waitingForObjectTimeout         = builder.waitingForObjectTimeout.toNanos();
-    poolName                             = builder.poolName;
+    this.poolName = builder.poolName;
   }
 
   public static Builder builder() {
