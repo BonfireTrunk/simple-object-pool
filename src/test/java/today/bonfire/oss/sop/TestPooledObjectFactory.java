@@ -1,8 +1,5 @@
 package today.bonfire.oss.sop;
 
-import lombok.Getter;
-import lombok.Setter;
-
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -10,7 +7,6 @@ import java.util.concurrent.atomic.AtomicLong;
  * A concrete implementation of PooledObjectFactory for testing purposes.
  * This factory provides real behavior instead of mocks, making tests more realistic.
  */
-@Getter @Setter
 public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObject> {
   private final    AtomicLong    idCounter                    = new AtomicLong(0);
   private          long          creationDelayMillis          = 0;
@@ -26,7 +22,84 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObje
   /**
    * Creates a factory where objects remain valid indefinitely
    */
-  public TestPooledObjectFactory() {}
+  public TestPooledObjectFactory() {
+  }
+
+  public AtomicLong getIdCounter() {
+    return idCounter;
+  }
+
+  public long getCreationDelayMillis() {
+    return creationDelayMillis;
+  }
+
+  public void setCreationDelayMillis(long creationDelayMillis) {
+    this.creationDelayMillis = creationDelayMillis;
+  }
+
+  public long getDestroyDelayMillis() {
+    return destroyDelayMillis;
+  }
+
+  public void setDestroyDelayMillis(long destroyDelayMillis) {
+    this.destroyDelayMillis = destroyDelayMillis;
+  }
+
+  public long getValidationDelayMillis() {
+    return validationDelayMillis;
+  }
+
+  public void setValidationDelayMillis(long validationDelayMillis) {
+    this.validationDelayMillis = validationDelayMillis;
+  }
+
+  public boolean isFailCreation() {
+    return failCreation;
+  }
+
+  public void setFailCreation(boolean failCreation) {
+    this.failCreation = failCreation;
+  }
+
+  public boolean isFailValidationForBorrow() {
+    return failValidationForBorrow;
+  }
+
+  public void setFailValidationForBorrow(boolean failValidationForBorrow) {
+    this.failValidationForBorrow = failValidationForBorrow;
+  }
+
+  public boolean isFailValidation() {
+    return failValidation;
+  }
+
+  public void setFailValidation(boolean failValidation) {
+    this.failValidation = failValidation;
+  }
+
+  public boolean isFailDestroy() {
+    return failDestroy;
+  }
+
+  public void setFailDestroy(boolean failDestroy) {
+    this.failDestroy = failDestroy;
+  }
+
+  public AtomicInteger getValidationForBorrowFailCount() {
+    return validationForBorrowFailCount;
+  }
+
+  public void setValidationForBorrowFailCount(AtomicInteger validationForBorrowFailCount) {
+    this.validationForBorrowFailCount = validationForBorrowFailCount;
+  }
+
+  public AtomicInteger getValidationFailCount() {
+    return validationFailCount;
+  }
+
+  public void setValidationFailCount(AtomicInteger validationFailCount) {
+    this.validationFailCount = validationFailCount;
+  }
 
   @Override
   public TestPoolObject createObject() {
@@ -45,11 +118,13 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObje
     return entity;
   }
 
-  @Override public void activateObject(TestPoolObject obj) {
+  @Override
+  public void activateObject(TestPoolObject obj) {
     // Do nothing
   }
 
-  @Override public void passivateObject(TestPoolObject obj) {
+  @Override
+  public void passivateObject(TestPoolObject obj) {
     // Do nothing
   }
 

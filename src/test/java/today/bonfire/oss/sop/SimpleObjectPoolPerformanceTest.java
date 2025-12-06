@@ -16,7 +16,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@Slf4j @ExtendWith(MockitoExtension.class)
+@Slf4j
+@ExtendWith(MockitoExtension.class)
 class SimpleObjectPoolPerformanceTest {
 
   private static final int  MAX_POOL_SIZE       = 10;
@@ -25,18 +26,21 @@ class SimpleObjectPoolPerformanceTest {
   private static final long ABANDONED_TIMEOUT   = 20000L;
   private static final int  NUM_BORROW_REQUESTS = 10000;
 
-
   @Test
   void testHighConcurrencyBorrowAndReturn() throws Exception {
     var factory = new TestPooledObjectFactory();
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
-                                                            .testWhileIdle(false)
-                                                            .waitingForObjectTimeout(Duration.ofSeconds(20))
-                                                            .objEvictionTimeout(Duration.ofMillis(IDLE_TIMEOUT))
-                                                            .abandonedTimeout(Duration.ofMillis(ABANDONED_TIMEOUT))
-                                                            .build(), factory);
+    factory.setValidationDelayMillis(5);
+    var pool = new SimpleObjectPool<>(
+        SimpleObjectPoolConfig.builder()
+                              .maxPoolSize(MAX_POOL_SIZE)
+                              .minPoolSize(MIN_POOL_SIZE)
+                              .testWhileIdle(false)
+                              .testOnBorrow(true)
+                              .fairness(true)
+                              .waitingForObjectTimeout(Duration.ofSeconds(60))
+                              .objEvictionTimeout(Duration.ofMillis(IDLE_TIMEOUT))
+                              .abandonedTimeout(Duration.ofMillis(ABANDONED_TIMEOUT))
+                              .build(), factory);
 
     ExecutorService               executor      = Executors.newVirtualThreadPerTaskExecutor();
     List<CompletableFuture<Void>> futures       = new ArrayList<>();
@@ -57,13 +61,19 @@ class SimpleObjectPoolPerformanceTest {
       }, executor));
     }
     assertThat(factory.getIdCounter().get()).isEqualTo(MAX_POOL_SIZE);
-    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
+    long startTime = System.currentTimeMillis();
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(60, TimeUnit.SECONDS);
+    long endTime  = System.currentTimeMillis();
+    long duration = endTime - startTime;
+    log.info("Total execution time: {} ms", duration);
+
     assertThat(pool.numOfTimesBorrowedFromPool()).isEqualTo(NUM_BORROW_REQUESTS);
     log.info("pool size: {}, times borrowed: {}", pool.currentPoolSize(), pool.numOfTimesBorrowedFromPool());
     for (var i = 0; i < MAX_POOL_SIZE; i++) {
       var       entity        = pool.borrowObject();
       final var timesBorrowed = pool.numOfTimesBorrowed(entity.getEntityId());
-      log.debug("Borrowed object's count {} with id {}", timesBorrowed, entity.getEntityId());
+      // the borrow count is +1 because of the borrowObject call above
+      log.debug("Borrowed object's borrowed count {} with id {}", timesBorrowed, entity.getEntityId());
     }
     assertThat(borrowCounter.get()).isEqualTo(NUM_BORROW_REQUESTS);
     pool.close();

@@ -14,18 +14,15 @@ import java.time.Duration;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class SimpleObjectPoolTest {
 
-  private static final int  MAX_POOL_SIZE       = 5;
-  private static final int  MIN_POOL_SIZE       = 0;
-  private static final long IDLE_TIMEOUT        = 1000L;
-  private static final long ABANDONED_TIMEOUT   = 2000L;
+  private static final int  MAX_POOL_SIZE     = 5;
+  private static final int  MIN_POOL_SIZE     = 0;
+  private static final long IDLE_TIMEOUT      = 1000L;
+  private static final long ABANDONED_TIMEOUT = 2000L;
   private static final long OBJECT_WAIT_TIMEOUT = 100L;
 
   private PooledObjectFactory<TestPoolObject> factory;
@@ -35,17 +32,18 @@ class SimpleObjectPoolTest {
   @BeforeEach
   void setUp() {
     factory = mock();
-    pool    = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                           .maxPoolSize(MAX_POOL_SIZE)
-                                                           .minPoolSize(MIN_POOL_SIZE)
-                                                           .testWhileIdle(true)
-                                                           .testOnCreate(false)
-                                                           .waitingForObjectTimeout(Duration.ofMillis(OBJECT_WAIT_TIMEOUT))
-                                                           .durationBetweenEvictionsRuns(Duration.ofMillis(IDLE_TIMEOUT))
-                                                           .objEvictionTimeout(Duration.ofMillis(IDLE_TIMEOUT))
-                                                           .durationBetweenAbandonCheckRuns(Duration.ofMillis(ABANDONED_TIMEOUT))
-                                                           .abandonedTimeout(Duration.ofMillis(ABANDONED_TIMEOUT))
-                                                           .build(), factory);
+    pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                        .maxPoolSize(MAX_POOL_SIZE)
+                                                        .minPoolSize(MIN_POOL_SIZE)
+                                                        .testWhileIdle(true)
+                                                        .testOnCreate(false)
+                                                        .testOnBorrow(true)
+                                                        .waitingForObjectTimeout(Duration.ofMillis(OBJECT_WAIT_TIMEOUT))
+                                                        .durationBetweenEvictionsRuns(Duration.ofMillis(IDLE_TIMEOUT))
+                                                        .objEvictionTimeout(Duration.ofMillis(IDLE_TIMEOUT))
+                                                        .durationBetweenAbandonCheckRuns(Duration.ofMillis(ABANDONED_TIMEOUT))
+                                                        .abandonedTimeout(Duration.ofMillis(ABANDONED_TIMEOUT))
+                                                        .build(), factory);
   }
 
   @AfterEach
@@ -95,6 +93,7 @@ class SimpleObjectPoolTest {
   void testPoolExhaustion() throws Exception {
     var config = pool.config().toBuilder()
                      .abandonedTimeout(Duration.ofSeconds(10))
+                     .testOnBorrow(true)
                      .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -123,7 +122,6 @@ class SimpleObjectPoolTest {
 
     localPool.close();
   }
-
 
   @Test
   void testObjectValidation() throws Exception {
@@ -204,6 +202,7 @@ class SimpleObjectPoolTest {
                                        .durationBetweenAbandonCheckRuns(Duration.ofMillis(5))
                                        .objEvictionTimeout(Duration.ofMillis(20))
                                        .durationBetweenEvictionsRuns(Duration.ofMillis(10))
+                                       .testOnBorrow(true)
                                        .build();
     pool = new SimpleObjectPool<>(config, factory);
     when(factory.createObject()).then(invocation -> new TestPoolObject());
@@ -243,7 +242,9 @@ class SimpleObjectPoolTest {
   void testMaxCreationAttemptsWithValidationFailure() throws Exception {
     var factory = new TestPooledObjectFactory();
     var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxRetries(3).build(), factory);
+                                                            .maxRetries(3)
+                                                            .testOnBorrow(true)
+                                                            .build(), factory);
 
     // Make all validations fail
     factory.setFailValidationForBorrow(true);
@@ -270,6 +271,8 @@ class SimpleObjectPoolTest {
                                        .objEvictionTimeout(Duration.ofSeconds(1000))
                                        .numValidationsPerEvictionRun(1)
                                        .durationBetweenEvictionsRuns(Duration.ofMillis(80))
+                                       .testOnBorrow(false)
+                                       .testOnReturn(false)
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -277,19 +280,22 @@ class SimpleObjectPoolTest {
     TestPoolObject obj2 = new TestPoolObject();
     TestPoolObject obj3 = new TestPoolObject();
     when(factory.createObject()).thenReturn(obj1, obj2, obj3);
+    when(factory.isObjectValid(obj1)).thenReturn(false);
+    lenient().when(factory.isObjectValid(obj2)).thenReturn(true);
+    lenient().when(factory.isObjectValid(obj3)).thenReturn(true);
     when(factory.isObjectValidForBorrow(any())).thenReturn(true);
 
     var borrowed1 = localPool.borrowObject();
     var borrowed2 = localPool.borrowObject();
     var borrowed3 = localPool.borrowObject();
 
-    Thread.sleep(100); // Wait for some time
+    Thread.sleep(500); // Wait for some time
 
     localPool.returnObject(borrowed1);
     localPool.returnObject(borrowed2);
     localPool.returnObject(borrowed3);
 
-    Thread.sleep(100); // Wait for eviction
+    Thread.sleep(300); // Wait for eviction
 
     assertThat(localPool.currentPoolSize())
         .as("Oldest object should be evicted")
@@ -313,7 +319,9 @@ class SimpleObjectPoolTest {
                                        .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.LEAST_USED)
                                        .objEvictionTimeout(Duration.ofMinutes(1))
                                        .numValidationsPerEvictionRun(1)
-                                       .durationBetweenEvictionsRuns(Duration.ofMillis(100))
+                                       .durationBetweenEvictionsRuns(Duration.ofMillis(80))
+                                       .testOnBorrow(true)
+                                       .testOnReturn(false)
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -354,6 +362,8 @@ class SimpleObjectPoolTest {
                                        .objEvictionTimeout(Duration.ofSeconds(1000))
                                        .numValidationsPerEvictionRun(1)
                                        .durationBetweenEvictionsRuns(Duration.ofMillis(80))
+                                       .testOnBorrow(true)
+                                       .testOnReturn(false)
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -392,6 +402,7 @@ class SimpleObjectPoolTest {
                                        .minPoolSize(0)
                                        .maxRetries(2)
                                        .retryCreationDelay(Duration.ofMillis(50))
+                                       .testOnBorrow(true)
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 
@@ -417,6 +428,7 @@ class SimpleObjectPoolTest {
                                        .minPoolSize(0)
                                        .abandonedTimeout(Duration.ofMillis(100))
                                        .durationBetweenAbandonCheckRuns(Duration.ofMillis(50))
+                                       .testOnBorrow(true)
                                        .build();
     var localPool = new SimpleObjectPool<>(config, factory);
 

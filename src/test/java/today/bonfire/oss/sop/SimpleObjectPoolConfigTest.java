@@ -22,12 +22,16 @@ class SimpleObjectPoolConfigTest {
   void setUp() {
     listAppender = new ListAppender<>();
     listAppender.start();
-    ((ch.qos.logback.classic.Logger) log).addAppender(listAppender);
+    if (log instanceof ch.qos.logback.classic.Logger l) {
+      l.addAppender(listAppender);
+    }
   }
 
   @AfterEach
   void tearDown() {
-    ((ch.qos.logback.classic.Logger) log).detachAppender(listAppender);
+    if (log instanceof ch.qos.logback.classic.Logger l) {
+      l.detachAppender(listAppender);
+    }
   }
 
   @Test
@@ -58,14 +62,16 @@ class SimpleObjectPoolConfigTest {
 
   @Test
   void validate_invalidDurationBetweenEvictionsRuns_negative() {
-    assertThatThrownBy(() -> SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofMillis(-1)).build())
+    assertThatThrownBy(
+        () -> SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofMillis(-1)).build())
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("durationBetweenEvictionsRuns must be positive");
   }
 
   @Test
   void validate_invalidDurationBetweenEvictionsRuns_zero() {
-    assertThatThrownBy(() -> SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofMillis(0)).build())
+    assertThatThrownBy(
+        () -> SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofMillis(0)).build())
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("durationBetweenEvictionsRuns must be positive");
   }
@@ -88,26 +94,30 @@ class SimpleObjectPoolConfigTest {
   void validate_invalidAbandonedTimeout_negative() {
     assertThatThrownBy(() -> SimpleObjectPoolConfig.builder().abandonedTimeout(Duration.ofMillis(-1)).build())
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessage("abandonedTimeout must be positive. It is a good idea to set this value based on your applications needs.");
+        .hasMessage(
+            "abandonedTimeout must be positive. It is a good idea to set this value based on your applications needs.");
   }
 
   @Test
   void validate_invalidAbandonedTimeout_zero() {
     assertThatThrownBy(() -> SimpleObjectPoolConfig.builder().abandonedTimeout(Duration.ofMillis(0)).build())
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessage("abandonedTimeout must be positive. It is a good idea to set this value based on your applications needs.");
+        .hasMessage(
+            "abandonedTimeout must be positive. It is a good idea to set this value based on your applications needs.");
   }
 
   @Test
   void validate_invalidDurationBetweenAbandonCheckRuns_negative() {
-    assertThatThrownBy(() -> SimpleObjectPoolConfig.builder().durationBetweenAbandonCheckRuns(Duration.ofMillis(-1)).build())
+    assertThatThrownBy(
+        () -> SimpleObjectPoolConfig.builder().durationBetweenAbandonCheckRuns(Duration.ofMillis(-1)).build())
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("durationBetweenAbandonCheckRuns must be positive");
   }
 
   @Test
   void validate_invalidDurationBetweenAbandonCheckRuns_zero() {
-    assertThatThrownBy(() -> SimpleObjectPoolConfig.builder().durationBetweenAbandonCheckRuns(Duration.ofMillis(0)).build())
+    assertThatThrownBy(
+        () -> SimpleObjectPoolConfig.builder().durationBetweenAbandonCheckRuns(Duration.ofMillis(0)).build())
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("durationBetweenAbandonCheckRuns must be positive");
   }
@@ -126,12 +136,10 @@ class SimpleObjectPoolConfigTest {
 
   @Test
   void validate_warningForNegativeMaxRetries() {
-    assertThatThrownBy(() ->
-        SimpleObjectPoolConfig.builder()
-            .maxRetries(-1)
-            .build()
-    ).isInstanceOf(IllegalArgumentException.class)
-        .hasMessage("maxRetries cannot be negative");
+    assertThatThrownBy(() -> SimpleObjectPoolConfig.builder()
+                                                   .maxRetries(-1)
+                                                   .build()).isInstanceOf(IllegalArgumentException.class)
+                                                            .hasMessage("maxRetries cannot be negative");
   }
 
   @Test
@@ -192,11 +200,13 @@ class SimpleObjectPoolConfigTest {
 
   @Test
   void validate_warnDurationBetweenEvictionsRuns_lessThanOrEqualToWaitingForObjectTimeout() {
-    SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofSeconds(1)).waitingForObjectTimeout(Duration.ofSeconds(1)).build();
+    SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofSeconds(1))
+                          .waitingForObjectTimeout(Duration.ofSeconds(1)).build();
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
+        .contains(
+            "durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
   }
 
   @Test
@@ -208,12 +218,14 @@ class SimpleObjectPoolConfigTest {
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
+        .contains(
+            "durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
   }
 
   @Test
   void validate_warnAbandonedTimeout_lessThanOrEqualToWaitingForObjectTimeout() {
-    SimpleObjectPoolConfig.builder().abandonedTimeout(Duration.ofSeconds(1)).waitingForObjectTimeout(Duration.ofSeconds(1)).build();
+    SimpleObjectPoolConfig.builder().abandonedTimeout(Duration.ofSeconds(1))
+                          .waitingForObjectTimeout(Duration.ofSeconds(1)).build();
     // Check logs for warning
     // log.warn("abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
   }
@@ -227,7 +239,8 @@ class SimpleObjectPoolConfigTest {
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
+        .contains(
+            "abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
   }
 
   @Test
@@ -302,7 +315,8 @@ class SimpleObjectPoolConfigTest {
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
+        .contains(
+            "durationBetweenEvictionsRuns is less than or equal to waitingForObjectTimeout. This may result in unnecessary actions on the pool.");
 
     // Test warning condition: abandonedTimeout <= waitingForObjectTimeout
     SimpleObjectPoolConfig.builder()
@@ -312,7 +326,8 @@ class SimpleObjectPoolConfigTest {
 
     assertThat(listAppender.list)
         .extracting(ILoggingEvent::getMessage)
-        .contains("abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
+        .contains(
+            "abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
   }
 
   @Test
