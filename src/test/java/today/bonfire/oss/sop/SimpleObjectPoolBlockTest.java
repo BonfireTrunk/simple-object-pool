@@ -15,7 +15,7 @@ class SimpleObjectPoolBlockTest {
     var factory = new TestPooledObjectFactory();
     var config = SimpleObjectPoolConfig.builder()
                                        .maxPoolSize(1)
-                                       .blockWhenExhausted(false)
+                                       .waitingForObjectTimeout(Duration.ZERO)
                                        .build();
 
     try (var pool = new SimpleObjectPool<>(config, factory)) {
@@ -43,8 +43,7 @@ class SimpleObjectPoolBlockTest {
     var factory = new TestPooledObjectFactory();
     var config = SimpleObjectPoolConfig.builder()
                                        .maxPoolSize(1)
-                                       .blockWhenExhausted(true)
-                                       .waitingForObjectTimeout(Duration.ofMillis(100))
+                                       .waitingForObjectTimeout(Duration.ofSeconds(1))
                                        .build();
 
     try (var pool = new SimpleObjectPool<>(config, factory)) {
@@ -56,7 +55,7 @@ class SimpleObjectPoolBlockTest {
       long duration = System.currentTimeMillis() - start;
 
       // Should wait for timeout
-      assertThat(duration).isGreaterThanOrEqualTo(100);
+      assertThat(duration).isGreaterThanOrEqualTo(1000);
     }
   }
 }
