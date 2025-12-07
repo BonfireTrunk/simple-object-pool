@@ -283,7 +283,6 @@ class SimpleObjectPoolTest {
     when(factory.isObjectValid(obj1)).thenReturn(false);
     lenient().when(factory.isObjectValid(obj2)).thenReturn(true);
     lenient().when(factory.isObjectValid(obj3)).thenReturn(true);
-    when(factory.isObjectValidForBorrow(any())).thenReturn(true);
 
     var borrowed1 = localPool.borrowObject();
     var borrowed2 = localPool.borrowObject();

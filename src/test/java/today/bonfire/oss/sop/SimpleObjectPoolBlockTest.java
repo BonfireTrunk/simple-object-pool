@@ -26,7 +26,7 @@ class SimpleObjectPoolBlockTest {
       long start = System.currentTimeMillis();
       assertThatThrownBy(() -> pool.borrowObject())
           .isInstanceOf(PoolTimeoutException.class)
-          .hasMessageContaining("Pool exhausted");
+          .hasMessageContaining("Timeout waiting for available object");
       long duration = System.currentTimeMillis() - start;
 
       // Should result in exception almost immediately, definitely less than default

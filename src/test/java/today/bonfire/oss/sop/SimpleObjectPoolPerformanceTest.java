@@ -60,13 +60,12 @@ class SimpleObjectPoolPerformanceTest {
         }
       }, executor));
     }
-    assertThat(factory.getIdCounter().get()).isEqualTo(MAX_POOL_SIZE);
     long startTime = System.currentTimeMillis();
     CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(60, TimeUnit.SECONDS);
     long endTime  = System.currentTimeMillis();
     long duration = endTime - startTime;
     log.info("Total execution time: {} ms", duration);
-
+    assertThat(factory.getIdCounter().get()).isEqualTo(MAX_POOL_SIZE);
     assertThat(pool.numOfTimesBorrowedFromPool()).isEqualTo(NUM_BORROW_REQUESTS);
     log.info("pool size: {}, times borrowed: {}", pool.currentPoolSize(), pool.numOfTimesBorrowedFromPool());
     for (var i = 0; i < MAX_POOL_SIZE; i++) {

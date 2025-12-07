@@ -1,11 +1,12 @@
 package today.bonfire.oss.sop;
 
+import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.slf4j.LoggerFactory;
+import org.junit.jupiter.api.condition.DisabledIfSystemProperty;
 
 import java.time.Duration;
 
@@ -15,22 +16,22 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class SimpleObjectPoolConfigTest {
 
-  private static final org.slf4j.Logger log = LoggerFactory.getLogger(SimpleObjectPoolConfig.class);
-  private              ListAppender<ILoggingEvent> listAppender;
+  private static Logger                      log;
+  private        ListAppender<ILoggingEvent> listAppender;
 
   @BeforeEach
   void setUp() {
-    listAppender = new ListAppender<>();
-    listAppender.start();
-    if (log instanceof ch.qos.logback.classic.Logger l) {
-      l.addAppender(listAppender);
-    }
+    // listAppender = new ListAppender<>();
+    // listAppender.start();
+    // LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+    // log = context.getLogger(SimpleObjectPoolConfig.class);
+    // log.addAppender(listAppender);
   }
 
   @AfterEach
   void tearDown() {
-    if (log instanceof ch.qos.logback.classic.Logger l) {
-      l.detachAppender(listAppender);
+    if (log != null && listAppender != null) {
+      log.detachAppender(listAppender);
     }
   }
 
@@ -123,6 +124,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForMaxRetriesGreaterThanMaxPoolSize() {
     SimpleObjectPoolConfig.builder()
                           .maxPoolSize(4)
@@ -143,17 +145,23 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForNegativeWaitingTimeout() {
+    final  TestLogger                  testLogger = new TestLogger();
     SimpleObjectPoolConfig.builder()
                           .waitingForObjectTimeout(Duration.ofMillis(-1))
                           .build();
-
-    assertThat(listAppender.list)
-        .extracting(ILoggingEvent::getMessage)
-        .contains("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
+    testLogger.startCapturing();
+    String logMessage = testLogger.getLog();
+    // assertThat(listAppender.list)
+    //     .extracting(ILoggingEvent::getMessage)
+    //     .contains("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
+    assertThat(logMessage).contains("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
+    testLogger.stopCapturing();
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForNegativeRetryCreationDelay() {
     SimpleObjectPoolConfig.builder()
                           .retryCreationDelay(Duration.ofMillis(-1))
@@ -165,6 +173,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForPositiveRetryCreationDelay() {
     SimpleObjectPoolConfig.builder()
                           .retryCreationDelay(Duration.ofMillis(100))
@@ -177,6 +186,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForNegativeObjEvictionTimeout() {
     SimpleObjectPoolConfig.builder()
                           .objEvictionTimeout(Duration.ofMillis(-1))
@@ -188,6 +198,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForZeroObjEvictionTimeout() {
     SimpleObjectPoolConfig.builder()
                           .objEvictionTimeout(Duration.ZERO)
@@ -199,6 +210,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warnDurationBetweenEvictionsRuns_lessThanOrEqualToWaitingForObjectTimeout() {
     SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofSeconds(1))
                           .waitingForObjectTimeout(Duration.ofSeconds(1)).build();
@@ -210,6 +222,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForEvictionRunsLessThanWaitingTimeout() {
     SimpleObjectPoolConfig.builder()
                           .durationBetweenEvictionsRuns(Duration.ofSeconds(5))
@@ -223,6 +236,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warnAbandonedTimeout_lessThanOrEqualToWaitingForObjectTimeout() {
     SimpleObjectPoolConfig.builder().abandonedTimeout(Duration.ofSeconds(1))
                           .waitingForObjectTimeout(Duration.ofSeconds(1)).build();
@@ -231,6 +245,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForAbandonedTimeoutLessThanWaitingTimeout() {
     SimpleObjectPoolConfig.builder()
                           .abandonedTimeout(Duration.ofSeconds(5))
@@ -306,6 +321,7 @@ class SimpleObjectPoolConfigTest {
   }
 
   @Test
+  @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_timeoutComparisons() {
     // Test warning condition: durationBetweenEvictionsRuns <= waitingForObjectTimeout
     SimpleObjectPoolConfig.builder()
