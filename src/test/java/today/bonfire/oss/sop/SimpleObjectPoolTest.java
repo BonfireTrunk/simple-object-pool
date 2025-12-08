@@ -464,4 +464,79 @@ class SimpleObjectPoolTest {
 
     localPool.close();
   }
+
+  @Test
+  void testEvictionLifecycle() throws Exception {
+    long evictionRunMillis = 50;
+
+    // Setup mock to return valid objects for initial minPoolSize creation
+    TestPoolObject initialObj1 = new TestPoolObject();
+    TestPoolObject initialObj2 = new TestPoolObject();
+    TestPoolObject obj         = new TestPoolObject();
+
+    when(factory.createObject()).thenReturn(initialObj1, initialObj2, obj);
+    when(factory.isObjectValid(any())).thenReturn(true);
+
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(5)
+                                       .minPoolSize(2)
+                                       .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.RANDOM)
+                                       .durationBetweenEvictionsRuns(Duration.ofMillis(evictionRunMillis))
+                                       .objEvictionTimeout(Duration.ofMinutes(10)) // Long timeout so we rely on validation
+                                       .testWhileIdle(true)
+                                       .numValidationsPerEvictionRun(5)
+                                       .build();
+    var localPool = new SimpleObjectPool<>(config, factory);
+
+    // Verify initial fill for minPoolSize = 2
+    verify(factory, times(2)).createObject();
+
+    // Setup for borrowing
+    lenient().when(factory.isObjectValidForBorrow(obj)).thenReturn(true);
+
+    // Borrow and return to make it idle
+    TestPoolObject borrowed = localPool.borrowObject();
+    localPool.returnObject(borrowed);
+
+    // Reset mocks to track eviction calls
+    clearInvocations(factory);
+
+    // Now setup for eviction run - we want to test that it calls activate -> isObjectValid -> passivate
+    when(factory.isObjectValid(any())).thenReturn(true);
+
+    // Wait for eviction run
+    Thread.sleep(evictionRunMillis * 3);
+
+    // Verify lifecycle calls - it might be called multiple times depending on sleep and run frequency
+    verify(factory, atLeastOnce()).activateObject(any());
+    verify(factory, atLeastOnce()).isObjectValid(any());
+    verify(factory, atLeastOnce()).passivateObject(any());
+
+    // NOT destroyed
+    verify(factory, never()).destroyObject(any());
+
+    // Now make isObjectValid return false to test eviction
+    when(factory.isObjectValid(any())).thenReturn(false);
+
+    // Wait for eviction run - wait a bit longer to ensure the eviction run picks up the change
+    Thread.sleep(evictionRunMillis * 4);
+
+    // Should be destroyed
+    verify(factory, atLeastOnce()).destroyObject(any());
+
+    // Should also verify that ensureMinIdle works. 
+    // If we destroyed objects and minPoolSize is 2, it should create new ones.
+    // We need to setup the mock to return new objects for ensureMinIdle
+    TestPoolObject newObj1 = new TestPoolObject();
+    TestPoolObject newObj2 = new TestPoolObject();
+    when(factory.createObject()).thenReturn(newObj1, newObj2);
+
+    // Wait a bit more for ensureMinIdle to kick in
+    Thread.sleep(evictionRunMillis * 2);
+
+    // Verify subsequent creation calls to maintain minPoolSize
+    verify(factory, atLeast(3)).createObject(); // 2 initial + at least 1 for ensureMinIdle
+
+    localPool.close();
+  }
 }
