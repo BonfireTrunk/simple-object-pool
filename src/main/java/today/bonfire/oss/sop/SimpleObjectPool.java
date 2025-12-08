@@ -32,6 +32,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private final PooledObjectFactory<T>                 factory;
   private final SimpleObjectPoolConfig                 config;
   private final ReentrantLock                          lock;
+  private final ReentrantLock creationLock;
   private final Condition                              notEmpty;
   private final Condition                              retryCreationWait;
   private final AtomicLong                             objectCreateCount = new AtomicLong(0);
@@ -42,6 +43,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     this.config       = config;
     this.factory      = factory;
     lock              = new ReentrantLock(config.fairness());
+    creationLock = new ReentrantLock();
     notEmpty          = lock.newCondition();
     retryCreationWait = lock.newCondition();
 
@@ -210,6 +212,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           // Remove from the main idle queue if it's still there
           if (idleObjects.remove(pooledObject)) {
             currentPoolSize.decrementAndGet();
+            notEmpty.signal();
             objectsToDestroy.add(pooledObject);
           } else {
             log.error("Possible memory leak: Object not found in idle queue when evicting: id={}, pool={}", pooledObject.id(), config.poolName());
@@ -249,7 +252,11 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         if (currentPoolSize.get() >= config.maxPoolSize()) {
           break;
         }
+        creationLock.lock();
         try {
+          if (currentPoolSize.get() >= config.maxPoolSize()) {
+            break;
+          }
           // We are in a scheduled thread, not blocking a user request, so standard create is fine?
           // createObject increments currentPoolSize and adds to valid creation counts inside the method or caller?
           // original constructor calls 'idleObjects.add(createObject()); currentPoolSize.incrementAndGet();'
@@ -260,6 +267,8 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           log.warn("Failed to create object to maintain minPoolSize", e);
           // If creation fails, waiting a bit or aborting this run is safer than tight loop spinning.
           break;
+        } finally {
+          creationLock.unlock();
         }
       }
     }
@@ -331,6 +340,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private void removeAndDestroyBorrowedObjects(PooledObject<T> pooledObject) {
     if (borrowedObjects.remove(pooledObject.id()) != null) {
       currentPoolSize.decrementAndGet();
+      notEmpty.signal();
     }
     try {
       factory.destroyObject(pooledObject.object());
@@ -405,9 +415,17 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
             }
 
             try {
-              pooledObject  = createObject();
-              createdObject = true;
-              retriesLeft--;
+              creationLock.lock();
+              try {
+                if (currentPoolSize.get() < config.maxPoolSize()) {
+                  pooledObject  = createObject();
+                  createdObject = true;
+                  currentPoolSize.incrementAndGet();
+                  retriesLeft--;
+                }
+              } finally {
+                creationLock.unlock();
+              }
             } catch (Exception e) {
               if (e instanceof PoolObjectValidationException) {
                 log.error("", e);
@@ -434,7 +452,16 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         // Validate object before borrowing if configured
         final var object = pooledObject.object();
         if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
-          removeAndDestroyBorrowedObjects(pooledObject);
+          // Object is invalid before it has been added to borrowedObjects or
+          // returned to the idle queue. We must destroy it and adjust the
+          // pool size, regardless of whether it was newly created or taken
+          // from idle.
+          currentPoolSize.decrementAndGet();
+          try {
+            factory.destroyObject(object);
+          } catch (Exception e) {
+            log.warn("Failed to destroy invalid object during borrow validation in pool - {}", config.poolName(), e);
+          }
           continue;
         }
 
@@ -443,7 +470,6 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         pooledObject.borrow();
         factory.activateObject(object);
         borrowedObjects.put(pooledObject.id(), pooledObject);
-        if (createdObject) currentPoolSize.incrementAndGet();
         timesBorrowed.incrementAndGet();
         notEmpty.signal();
         log.trace("Resource borrowed - id: {}, current pool size: {}",

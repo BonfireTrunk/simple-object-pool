@@ -1,12 +1,14 @@
 package today.bonfire.oss.sop;
 
 import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledIfSystemProperty;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 
@@ -21,11 +23,11 @@ class SimpleObjectPoolConfigTest {
 
   @BeforeEach
   void setUp() {
-    // listAppender = new ListAppender<>();
-    // listAppender.start();
-    // LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
-    // log = context.getLogger(SimpleObjectPoolConfig.class);
-    // log.addAppender(listAppender);
+    listAppender = new ListAppender<>();
+    listAppender.start();
+    LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+    log = context.getLogger(SimpleObjectPoolConfig.class);
+    log.addAppender(listAppender);
   }
 
   @AfterEach
@@ -147,17 +149,13 @@ class SimpleObjectPoolConfigTest {
   @Test
   @DisabledIfSystemProperty(named = "surefire.test.class.path", matches = ".*")
   void validate_warningForNegativeWaitingTimeout() {
-    final  TestLogger                  testLogger = new TestLogger();
     SimpleObjectPoolConfig.builder()
                           .waitingForObjectTimeout(Duration.ofMillis(-1))
                           .build();
-    testLogger.startCapturing();
-    String logMessage = testLogger.getLog();
-    // assertThat(listAppender.list)
-    //     .extracting(ILoggingEvent::getMessage)
-    //     .contains("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
-    assertThat(logMessage).contains("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
-    testLogger.stopCapturing();
+
+    assertThat(listAppender.list)
+        .extracting(ILoggingEvent::getMessage)
+        .contains("waitingForObjectTimeout is negative. This assumes that the there will be no waiting timeout.");
   }
 
   @Test
