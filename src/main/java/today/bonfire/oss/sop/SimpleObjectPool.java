@@ -64,47 +64,6 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
   }
 
-
-  /**
-   * Returns the configuration used by this object pool.
-   *
-   * @return the configuration used by this object pool
-   */
-  public SimpleObjectPoolConfig config() {
-    return config;
-  }
-
-  /**
-   * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
-   * This method is called periodically when pool size is greater than minPoolSize.
-   * Evicted objects are destroyed using the objectFactory.
-   */
-
-  /**
-   * Performs eviction of idle objects from the pool.
-   * <p>
-   * This method can be called manually to trigger an eviction run outside of the
-   * scheduled eviction cycle. It examines idle objects and evicts those that:
-   * <ul>
-   *   <li>Have been idle longer than {@link SimpleObjectPoolConfig#objEvictionTimeout()}</li>
-   *   <li>Fail validation if {@link SimpleObjectPoolConfig#testWhileIdle()} is enabled</li>
-   * </ul>
-   * </p>
-   * <p>
-   * The number of objects examined is determined by
-   * {@link SimpleObjectPoolConfig#numValidationsPerEvictionRun()}.
-   * </p>
-   * <p>
-   * After eviction, the pool will attempt to maintain the minimum idle pool size
-   * by creating new objects if necessary.
-   * </p>
-   *
-   * @throws Exception if an error occurs during eviction
-   */
-  public void evict() throws Exception {
-    evictionRun(true); // Test all idle objects when manually invoked
-  }
-
   /**
    * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
    * This method is called periodically when pool size is greater than minPoolSize.
@@ -217,7 +176,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           } else {
             log.error("Possible memory leak: Object not found in idle queue when evicting: id={}, pool={}", pooledObject.id(), config.poolName());
           }
-           
+
         }
       }
 
@@ -240,6 +199,12 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     // Ensure min pool size
     ensureMinIdle();
   }
+
+  /**
+   * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
+   * This method is called periodically when pool size is greater than minPoolSize.
+   * Evicted objects are destroyed using the objectFactory.
+   */
 
   private void ensureMinIdle() {
     if (config.minPoolSize() > 0 && idleObjects.size() < config.minPoolSize() && currentPoolSize.get() < config.maxPoolSize()) {
@@ -275,37 +240,6 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   }
 
   /**
-   * Destroys all idle objects in the pool.
-   * This method removes and destroys all objects from the idle queue,
-   * regardless of the minimum pool size or idle time.
-   */
-  public void destroyAllIdleObjects() {
-    try {
-      lock.lock();
-      // Collect all idle objects for destruction
-      var objectsToDestroy = new ArrayList<>(idleObjects);
-      idleObjects.clear();
-      currentPoolSize.addAndGet(Math.negateExact(objectsToDestroy.size()));
-
-      // Destroy collected objects
-      for (PooledObject<T> pooledObject : objectsToDestroy) {
-        log.debug("Destroying idle object with id {}.", pooledObject.id());
-        try {
-          factory.destroyObject(pooledObject.object());
-        } catch (Exception e) {
-          log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
-        }
-      }
-      log.info("Destroyed {} idle objects. Current pool size: {}",
-               objectsToDestroy.size(), currentPoolSize());
-    } catch (Exception e) {
-      log.error("Error destroying all idle objects", e);
-    } finally {
-      lock.unlock();
-    }
-  }
-
-  /**
    * Internal method to detect and remove objects that have been borrowed but not returned within abandonedObjectTimeout.
    * This helps prevent resource leaks when clients fail to return objects.
    * Abandoned objects are destroyed using the objectFactory.
@@ -322,7 +256,8 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       });
 
       for (PooledObject<T> pooledObject : objectsToRemove) {
-        log.warn("Removing abandoned object with id {} in pool - {}. It has been borrowed for more than {} ms and destroying it.", pooledObject.id(), config.poolName(), now - pooledObject.lastBorrowedTime());
+        log.warn("Removing abandoned object with id {} in pool - {}. It has been borrowed for more than {} ms and destroying it.", pooledObject.id(), config.poolName(),
+                 now - pooledObject.lastBorrowedTime());
         removeAndDestroyBorrowedObjects(pooledObject);
       }
     } catch (Exception e) {
@@ -363,6 +298,71 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       }
     }
     return pooledObject;
+  }
+
+  /**
+   * Returns the configuration used by this object pool.
+   *
+   * @return the configuration used by this object pool
+   */
+  public SimpleObjectPoolConfig config() {
+    return config;
+  }
+
+  /**
+   * Performs eviction of idle objects from the pool.
+   * <p>
+   * This method can be called manually to trigger an eviction run outside of the
+   * scheduled eviction cycle. It examines idle objects and evicts those that:
+   * <ul>
+   *   <li>Have been idle longer than {@link SimpleObjectPoolConfig#objEvictionTimeout()}</li>
+   *   <li>Fail validation if {@link SimpleObjectPoolConfig#testWhileIdle()} is enabled</li>
+   * </ul>
+   * </p>
+   * <p>
+   * The number of objects examined is determined by
+   * {@link SimpleObjectPoolConfig#numValidationsPerEvictionRun()}.
+   * </p>
+   * <p>
+   * After eviction, the pool will attempt to maintain the minimum idle pool size
+   * by creating new objects if necessary.
+   * </p>
+   *
+   * @throws Exception if an error occurs during eviction
+   */
+  public void evict() throws Exception {
+    evictionRun(true); // Test all idle objects when manually invoked
+  }
+
+  /**
+   * Destroys all idle objects in the pool.
+   * This method removes and destroys all objects from the idle queue,
+   * regardless of the minimum pool size or idle time.
+   */
+  public void destroyAllIdleObjects() {
+    try {
+      lock.lock();
+      // Collect all idle objects for destruction
+      var objectsToDestroy = new ArrayList<>(idleObjects);
+      idleObjects.clear();
+      currentPoolSize.addAndGet(Math.negateExact(objectsToDestroy.size()));
+
+      // Destroy collected objects
+      for (PooledObject<T> pooledObject : objectsToDestroy) {
+        log.debug("Destroying idle object with id {}.", pooledObject.id());
+        try {
+          factory.destroyObject(pooledObject.object());
+        } catch (Exception e) {
+          log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
+        }
+      }
+      log.info("Destroyed {} idle objects. Current pool size: {}",
+               objectsToDestroy.size(), currentPoolSize());
+    } catch (Exception e) {
+      log.error("Error destroying all idle objects", e);
+    } finally {
+      lock.unlock();
+    }
   }
 
   /**
@@ -467,14 +467,26 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
 
         // Object is valid, prepare for borrowing
-        pooledObject.borrow();
-        factory.activateObject(object);
-        borrowedObjects.put(pooledObject.id(), pooledObject);
-        timesBorrowed.incrementAndGet();
-        notEmpty.signal();
-        log.trace("Resource borrowed - id: {}, current pool size: {}",
-                  pooledObject.id(), currentPoolSize.get());
-        return object;
+        try {
+          pooledObject.borrow();
+          factory.activateObject(object);
+          borrowedObjects.put(pooledObject.id(), pooledObject);
+          timesBorrowed.incrementAndGet();
+          notEmpty.signal();
+          log.trace("Resource borrowed - id: {}, current pool size: {}",
+                    pooledObject.id(), currentPoolSize.get());
+          return object;
+        } catch (Exception e) {
+          log.warn("Failed to activate object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
+          currentPoolSize.decrementAndGet();
+          try {
+            factory.destroyObject(object);
+          } catch (Exception destroyEx) {
+            log.warn("Failed to destroy object after activation failure in pool - {}", config.poolName(), destroyEx);
+          }
+          // Continue the loop to try getting another object
+          continue;
+        }
       } while (remainingNanos > 0);
 
       throw new PoolTimeoutException("Timeout waiting for an available object to borrow");
@@ -493,6 +505,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    *
    * @param obj    The object to return to the pool
    * @param broken Flag indicating if the object is in a broken state
+   *
    * @throws PoolObjectException if object validation fails
    */
   public void returnObject(T obj, boolean broken) throws PoolObjectException {
@@ -550,6 +563,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    * Returns a borrowed object back to the pool.
    *
    * @param obj The object to return to the pool
+   *
    * @throws PoolObjectException if object validation fails
    */
   public void returnObject(T obj) throws PoolObjectException {
@@ -676,6 +690,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    * If you need to check, check only for borrowed objects.
    *
    * @param objectId the id of the object to query, may be null
+   *
    * @return the number of times the object has been borrowed
    */
   public long numOfTimesBorrowed(Long objectId) {

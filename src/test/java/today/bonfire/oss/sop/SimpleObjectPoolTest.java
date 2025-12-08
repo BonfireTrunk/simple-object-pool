@@ -10,11 +10,17 @@ import today.bonfire.oss.sop.exceptions.PoolObjectException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
+
 
 @ExtendWith(MockitoExtension.class)
 class SimpleObjectPoolTest {
@@ -49,8 +55,112 @@ class SimpleObjectPoolTest {
   @AfterEach
   void tearDown() {
     if (pool != null) {
-      pool.close();
+      if (!pool.isClosed()) {
+        pool.close();
+      }
     }
+  }
+
+  @Test
+  void testDestroyAllIdleObjects() throws Exception {
+    TestPoolObject obj1 = new TestPoolObject();
+    TestPoolObject obj2 = new TestPoolObject();
+    when(factory.createObject()).thenReturn(obj1, obj2);
+    when(factory.isObjectValidForBorrow(any())).thenReturn(true);
+
+    // Populate pool
+    var b1 = pool.borrowObject();
+    var b2 = pool.borrowObject();
+    pool.returnObject(b1);
+    pool.returnObject(b2);
+
+    assertThat(pool.idleObjectCount()).isEqualTo(2);
+
+    pool.destroyAllIdleObjects();
+
+    assertThat(pool.idleObjectCount()).isEqualTo(0);
+    assertThat(pool.currentPoolSize()).isEqualTo(0);
+    verify(factory, times(1)).destroyObject(obj1);
+    verify(factory, times(1)).destroyObject(obj2);
+  }
+
+  @Test
+  void testStatistics() throws Exception {
+    TestPoolObject obj = new TestPoolObject();
+    when(factory.createObject()).thenReturn(obj);
+    when(factory.isObjectValidForBorrow(obj)).thenReturn(true);
+
+    assertThat(pool.numOfObjectsCreated()).isEqualTo(0);
+    assertThat(pool.numOfTimesBorrowedFromPool()).isEqualTo(0);
+
+    var b1 = pool.borrowObject();
+    pool.returnObject(b1);
+
+    var b2 = pool.borrowObject();
+
+    assertThat(pool.numOfObjectsCreated()).isEqualTo(1);
+    assertThat(pool.numOfTimesBorrowedFromPool()).isEqualTo(2);
+
+    // Check specific object stats
+    // Note: implementation might be tricky if it depends on internal wrapper state not updated by mock?
+    // The wrapper 'PooledObject' tracks timesBorrowed.
+    assertThat(pool.numOfTimesBorrowed(obj.getEntityId())).isEqualTo(2);
+  }
+
+  @Test
+  void testManualEvictClearsAllIdle() throws Exception {
+    // Setup pool that allows many idle objects
+    factory = mock(PooledObjectFactory.class);
+    // We need a fresh pool with NO scheduled eviction handling interfering or limited batch size
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(10)
+                                       .minPoolSize(0)
+                                       .objEvictionTimeout(Duration.ofMillis(1)) // Instant expiration
+                                       .numValidationsPerEvictionRun(1) // Configured to only check 1 per run (scheduled)
+                                       .build();
+    var localPool = new SimpleObjectPool<>(config, factory);
+
+    TestPoolObject o1 = new TestPoolObject();
+    TestPoolObject o2 = new TestPoolObject();
+    TestPoolObject o3 = new TestPoolObject();
+    when(factory.createObject()).thenReturn(o1, o2, o3);
+
+    // Create 3 idle objects
+    var b1 = localPool.borrowObject();
+    var b2 = localPool.borrowObject();
+    var b3 = localPool.borrowObject();
+    localPool.returnObject(b1);
+    localPool.returnObject(b2);
+    localPool.returnObject(b3);
+
+    Thread.sleep(10); // Ensure they are expired
+
+    // Manual evict should clear ALL despite numValidationsPerEvictionRun=1
+    localPool.evict();
+
+    assertThat(localPool.idleObjectCount()).isEqualTo(0);
+    verify(factory).destroyObject(o1);
+    verify(factory).destroyObject(o2);
+    verify(factory).destroyObject(o3);
+
+    localPool.close();
+  }
+
+  @Test
+  void testReturnForeignObject() {
+    TestPoolObject foreign = new TestPoolObject();
+    foreign.setEntityId(999L);
+    // Should verify it logs warning and returns without error
+    pool.returnObject(foreign);
+    // No exception, no side effect on pool size
+    assertThat(pool.currentPoolSize()).isEqualTo(0);
+  }
+
+  @Test
+  void testReturnNullObject() {
+    assertThatThrownBy(() -> pool.returnObject(null))
+        .isInstanceOf(PoolException.class)
+        .hasMessageContaining("Cannot return null object");
   }
 
   @Test
@@ -536,6 +646,217 @@ class SimpleObjectPoolTest {
 
     // Verify subsequent creation calls to maintain minPoolSize
     verify(factory, atLeast(3)).createObject(); // 2 initial + at least 1 for ensureMinIdle
+
+    localPool.close();
+  }
+
+  @Test
+  void testObjectCreationFailuresDoNotLeakPoolSize() throws Exception {
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(2)
+                                       .minPoolSize(0)
+                                       .maxRetries(1)
+                                       .testOnBorrow(false)
+                                       .build();
+
+    // Custom factory to simulate failures
+    PooledObjectFactory<TestPoolObject> failingFactory = mock(PooledObjectFactory.class);
+
+    // First attempt throws exception
+    when(failingFactory.createObject())
+        .thenThrow(new RuntimeException("Simulated creation failure"))
+        .thenReturn(new TestPoolObject()); // Second attempt succeeds
+
+    var localPool = new SimpleObjectPool<>(config, failingFactory);
+
+    // Let's try to verify size is 0 after failure
+    // We expect it to fail because maxRetries=1 means 1 initial try + 1 retry (both might fail or we force it)
+    // Actually we only mocked 1 failure then success.
+    // So 1st try fails (retriesLeft=1), catches, loop continues.
+    // 2nd try (retriesLeft=0) succeeds.
+    // So borrow should succeed!
+
+    TestPoolObject obj = localPool.borrowObject();
+    assertThat(obj).isNotNull();
+    assertThat(localPool.currentPoolSize())
+        .as("Pool size should be 1 after successful creation (despite initial failure)")
+        .isEqualTo(1);
+
+    // Now force total failure
+    reset(failingFactory);
+    when(failingFactory.createObject()).thenThrow(new RuntimeException("Always fail"));
+
+    assertThatThrownBy(() -> localPool.borrowObject())
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("Always fail");
+
+    assertThat(localPool.currentPoolSize())
+        .as("Pool size should be 1 (from previous successful borrow that was returned/kept?) Wait, we borrowed 'obj'. Is it returned? No.")
+        .isEqualTo(1);
+
+    // Wait, if we borrowed 'obj', it's in borrowedObjects or local var. 
+    // currentPoolSize includes borrowed.
+    // So distinct failure calls shouldn't increment it further.
+
+    localPool.close();
+  }
+
+  @Test
+  void testConcurrentBorrowCreatesOnlyUpToMaxSize() throws Exception {
+    int maxPoolSize = 5;
+    int threadCount = 20;
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(maxPoolSize)
+                                       .minPoolSize(0)
+                                       .waitingForObjectTimeout(Duration.ofMillis(500))
+                                       .build();
+
+    // Use a real factory for concurrency to avoid Mockito overhead/issues
+    PooledObjectFactory<TestPoolObject> realFactory = new PooledObjectFactory<>() {
+      @Override
+      public TestPoolObject createObject() {
+        try {Thread.sleep(10);} catch (InterruptedException e) {}
+        return new TestPoolObject();
+      }
+
+      @Override
+      public void activateObject(TestPoolObject obj) {}
+
+      @Override
+      public void passivateObject(TestPoolObject obj) {}
+
+      @Override
+      public boolean isObjectValidForBorrow(TestPoolObject obj) {return true;}
+
+      @Override
+      public boolean isObjectValid(TestPoolObject obj) {return true;}
+
+      @Override
+      public void destroyObject(TestPoolObject obj) {}
+    };
+
+    var             localPool    = new SimpleObjectPool<>(config, realFactory);
+    CountDownLatch  startLatch   = new CountDownLatch(1);
+    CountDownLatch  doneLatch    = new CountDownLatch(threadCount);
+    ExecutorService executor     = Executors.newFixedThreadPool(threadCount);
+    AtomicInteger   successCount = new AtomicInteger(0);
+    AtomicInteger   timeoutCount = new AtomicInteger(0);
+
+    for (int i = 0; i < threadCount; i++) {
+      executor.submit(() -> {
+        try {
+          startLatch.await();
+          TestPoolObject obj = localPool.borrowObject();
+          successCount.incrementAndGet();
+          Thread.sleep(20);
+          localPool.returnObject(obj);
+        } catch (PoolTimeoutException pte) {
+          timeoutCount.incrementAndGet();
+        } catch (Exception e) {
+          // ignore
+        } finally {
+          doneLatch.countDown();
+        }
+      });
+    }
+
+    startLatch.countDown();
+    doneLatch.await(10, TimeUnit.SECONDS);
+    executor.shutdownNow();
+
+    assertThat(localPool.currentPoolSize())
+        .as("Pool size should never exceed maxPoolSize")
+        .isLessThanOrEqualTo(maxPoolSize);
+
+    assertThat(localPool.currentPoolSize())
+        .as("Pool should have created some objects")
+        .isGreaterThan(0);
+
+    localPool.close();
+  }
+
+  @Test
+  void testHammerThePool() throws Exception {
+    int maxPoolSize = 10;
+    int threadCount = 50;
+    int iterations  = 50;
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(maxPoolSize)
+                                       .minPoolSize(0)
+                                       // Small wait to ensure high contention
+                                       .waitingForObjectTimeout(Duration.ofMillis(100))
+                                       .build();
+
+    // Use robust factory
+    var localFactory = new TestPooledObjectFactory();
+    var localPool    = new SimpleObjectPool<>(config, localFactory);
+
+    ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+    CountDownLatch  latch    = new CountDownLatch(threadCount);
+    AtomicInteger   errors   = new AtomicInteger(0);
+    AtomicInteger   timeouts = new AtomicInteger(0);
+
+    for (int i = 0; i < threadCount; i++) {
+      executor.submit(() -> {
+        try {
+          for (int j = 0; j < iterations; j++) {
+            try {
+              TestPoolObject obj = localPool.borrowObject();
+              // fast return
+              localPool.returnObject(obj);
+            } catch (PoolTimeoutException e) {
+              timeouts.incrementAndGet();
+            } catch (Exception e) {
+              errors.incrementAndGet();
+            }
+          }
+        } finally {
+          latch.countDown();
+        }
+      });
+    }
+
+    boolean finished = latch.await(15, TimeUnit.SECONDS);
+    executor.shutdownNow();
+
+    assertThat(finished).as("Test did not finish in time").isTrue();
+    assertThat(errors.get()).as("Unexpected errors during stress test").isEqualTo(0);
+
+    // Invariants check
+    assertThat(localPool.currentPoolSize())
+        .as("Pool size should verify: current <= max")
+        .isLessThanOrEqualTo(maxPoolSize);
+
+    assertThat(localPool.borrowedObjectsCount())
+        .as("All objects should be returned")
+        .isEqualTo(0);
+
+    localPool.close();
+  }
+
+  @Test
+  void testActivationFailureDoesNotLeak() throws Exception {
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(1)
+                                       .build();
+
+    PooledObjectFactory<TestPoolObject> badFactory = mock(PooledObjectFactory.class);
+    when(badFactory.createObject()).thenReturn(new TestPoolObject());
+
+    // Activation fails
+    doThrow(new RuntimeException("Activation BOOM")).when(badFactory).activateObject(any());
+
+    var localPool = new SimpleObjectPool<>(config, badFactory);
+
+    // Borrow should fail because activation fails and retries enforce limit
+    assertThatThrownBy(() -> localPool.borrowObject())
+        // Retries are exhausted, so it throws PoolObjectException (Max retries reached)
+        .isInstanceOf(PoolObjectException.class)
+        .hasMessageContaining("Max retries reached");
+
+    assertThat(localPool.currentPoolSize())
+        .as("Pool size should be 0 because the only object created failed activation and should be destroyed/removed")
+        .isEqualTo(0);
 
     localPool.close();
   }
