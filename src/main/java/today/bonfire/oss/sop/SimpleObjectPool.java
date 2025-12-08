@@ -43,7 +43,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     this.config       = config;
     this.factory      = factory;
     lock              = new ReentrantLock(config.fairness());
-    creationLock = new ReentrantLock();
+    creationLock = new ReentrantLock(true);
     notEmpty          = lock.newCondition();
     retryCreationWait = lock.newCondition();
 
