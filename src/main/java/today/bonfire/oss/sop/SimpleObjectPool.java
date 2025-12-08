@@ -32,7 +32,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private final PooledObjectFactory<T>                 factory;
   private final SimpleObjectPoolConfig                 config;
   private final ReentrantLock                          lock;
-  private final ReentrantLock creationLock;
+  private final ReentrantLock                          creationLock;
   private final Condition                              notEmpty;
   private final Condition                              retryCreationWait;
   private final AtomicLong                             objectCreateCount = new AtomicLong(0);
@@ -43,7 +43,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     this.config       = config;
     this.factory      = factory;
     lock              = new ReentrantLock(config.fairness());
-    creationLock = new ReentrantLock(true);
+    creationLock      = new ReentrantLock(true);
     notEmpty          = lock.newCondition();
     retryCreationWait = lock.newCondition();
 
@@ -216,7 +216,6 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           }
           // We are in a scheduled thread, not blocking a user request, so standard create is fine?
           // createObject increments currentPoolSize and adds to valid creation counts inside the method or caller?
-          // original constructor calls 'idleObjects.add(createObject()); currentPoolSize.incrementAndGet();'
           createAndAddIdleObject();
         } catch (Exception e) {
           log.warn("Failed to create object to maintain minPoolSize", e);
@@ -406,11 +405,10 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         throw new PoolTimeoutException("Timeout waiting to acquire lock to borrow object");
       }
       remainingNanos = waitTimeout - (System.nanoTime() - startTime);
-      boolean createdObject = false;
       do {
         // First try to get from idle objects
-        pooledObject  = idleObjects.poll();
-        createdObject = false;
+        boolean newlyCreated = false;
+        pooledObject = idleObjects.poll();
         if (pooledObject == null) {
           // Try to create new, if pool is not full
           if (borrowedObjects.size() < config.maxPoolSize()) {
@@ -435,8 +433,8 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
               creationLock.lock();
               try {
                 if (currentPoolSize.get() < config.maxPoolSize()) {
-                  pooledObject  = createObject();
-                  createdObject = true;
+                  pooledObject = createObject();
+                  newlyCreated = true;
                   currentPoolSize.incrementAndGet();
                   retriesLeft--;
                 }
@@ -475,7 +473,9 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         final var object = pooledObject.object();
         try {
           pooledObject.borrow();
-          factory.activateObject(object);
+          if (!newlyCreated) {
+             factory.activateObject(object);
+          }
           borrowedObjects.put(pooledObject.id(), pooledObject);
           timesBorrowed.incrementAndGet();
           notEmpty.signal();
