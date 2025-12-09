@@ -23,11 +23,13 @@ class SimpleObjectPoolConfigTest {
 
   @BeforeEach
   void setUp() {
-    listAppender = new ListAppender<>();
-    listAppender.start();
-    LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
-    log = context.getLogger(SimpleObjectPoolConfig.class);
-    log.addAppender(listAppender);
+    if (System.getProperty("surefire.test.class.path") == null) {
+      listAppender = new ListAppender<>();
+      listAppender.start();
+      LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
+      log = context.getLogger(SimpleObjectPoolConfig.class);
+      log.addAppender(listAppender);
+    }
   }
 
   @AfterEach
