@@ -22,8 +22,8 @@ public interface PooledObjectFactory<T extends PoolObject> {
 
   /**
    * Activates the pooled object.
-   * This method is called when the object is taken from the pool,
-   * and is responsible for any necessary activation or initialization setting before borrow.
+   * This method is called when the object is taken from the pool
+   * and is responsible for any necessary activation or initialization setting before borrowing.
    *
    * @param obj the object to activate, must not be null.
    */
@@ -32,7 +32,7 @@ public interface PooledObjectFactory<T extends PoolObject> {
 
   /**
    * Passivates the pooled object.
-   * This method is called when the object is being returned to the pool,
+   * This method is called when the object is being returned to the pool
    * and is responsible for any necessary passivation or cleaning-up before returning to pool.
    *
    * @param obj the object to passivate, must not be null.

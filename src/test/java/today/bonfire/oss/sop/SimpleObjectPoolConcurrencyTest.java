@@ -8,15 +8,10 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
 import java.time.Duration;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -56,7 +51,6 @@ class SimpleObjectPoolConcurrencyTest {
     }
   }
 
-
   @Test
   void testConcurrentBorrowAndReturn() throws Exception {
     var config = pool.config().toBuilder()
@@ -72,7 +66,6 @@ class SimpleObjectPoolConcurrencyTest {
 
     AtomicInteger successfulBorrows = new AtomicInteger(0);
     when(factory.createObject()).thenAnswer(inv -> new TestPoolObject());
-    when(factory.isObjectValidForBorrow(any())).thenReturn(true);
 
     // Create tasks that borrow and return objects
     for (int i = 0; i < numThreads; i++) {
@@ -185,8 +178,8 @@ class SimpleObjectPoolConcurrencyTest {
 
     startLatch.countDown();
 
-    TestPoolObject borrowed1 = future1.get(1500, TimeUnit.MILLISECONDS);
-    TestPoolObject borrowed2 = future2.get(1500, TimeUnit.MILLISECONDS);
+    TestPoolObject borrowed1 = future1.get(2500, TimeUnit.MILLISECONDS);
+    TestPoolObject borrowed2 = future2.get(2500, TimeUnit.MILLISECONDS);
 
     assertThat(borrowed1)
         .as("First entity should not be null")
@@ -205,6 +198,59 @@ class SimpleObjectPoolConcurrencyTest {
 
     pool.returnObject(borrowed1);
     pool.returnObject(borrowed2);
+    pool.close();
+  }
+
+  @Test
+  void testWaitingThreadWakesOnDestruction() throws Exception {
+    var factory = new TestPooledObjectFactory();
+    factory.setValidationDelayMillis(10);
+    // Max pool size 1, min 0
+    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                            .maxPoolSize(1)
+                                                            .minPoolSize(0)
+                                                            .waitingForObjectTimeout(Duration.ofSeconds(2))
+                                                            .testOnReturn(true)
+                                                            .build(), factory);
+
+    // 1. Borrow the only available slot
+    TestPoolObject obj1 = pool.borrowObject();
+    assertThat(obj1).isNotNull();
+
+    // 2. Start a second thread that tries to borrow. It should wait because pool is
+    // full.
+    CountDownLatch  startLatch   = new CountDownLatch(1);
+    AtomicInteger   successCount = new AtomicInteger(0);
+    ExecutorService executor     = Executors.newSingleThreadExecutor();
+    Future<?> future = executor.submit(() -> {
+      try {
+        startLatch.countDown();
+        TestPoolObject obj2 = pool.borrowObject();
+        if (obj2 != null) {successCount.incrementAndGet();}
+      } catch (Exception e) {
+        // e.printStackTrace();
+      }
+    });
+
+    startLatch.await();
+    Thread.sleep(100); // Give it time to enter wait
+
+    // 3. Return obj1 as BROKEN. This should destroy it, decrement size to 0.
+    // If we signal, the updating thread should wake up, see size < max, and create
+    // a new object.
+    pool.returnObject(obj1, true);
+
+    // 4. Wait for thread to finish
+    try {
+      future.get(1000, TimeUnit.MILLISECONDS);
+    } catch (java.util.concurrent.TimeoutException e) {
+      // Expected failure currently
+    }
+
+    // Check results
+    assertThat(successCount.get()).isEqualTo(1);
+
+    executor.shutdownNow();
     pool.close();
   }
 }

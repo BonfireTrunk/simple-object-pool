@@ -6,16 +6,11 @@ import today.bonfire.oss.sop.exceptions.PoolObjectException;
 import today.bonfire.oss.sop.exceptions.PoolObjectValidationException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -37,6 +32,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private final PooledObjectFactory<T>                 factory;
   private final SimpleObjectPoolConfig                 config;
   private final ReentrantLock                          lock;
+  private final ReentrantLock                          creationLock;
   private final Condition                              notEmpty;
   private final Condition                              retryCreationWait;
   private final AtomicLong                             objectCreateCount = new AtomicLong(0);
@@ -47,18 +43,14 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
     this.config       = config;
     this.factory      = factory;
     lock              = new ReentrantLock(config.fairness());
+    creationLock      = new ReentrantLock(true);
     notEmpty          = lock.newCondition();
     retryCreationWait = lock.newCondition();
 
-    scheduler.scheduleAtFixedRate(this::evictionRun, config.durationBetweenEvictionsRuns(), config.durationBetweenEvictionsRuns(), TimeUnit.MILLISECONDS);
+    scheduler.scheduleAtFixedRate(() -> evictionRun(false), config.durationBetweenEvictionsRuns(), config.durationBetweenEvictionsRuns(), TimeUnit.MILLISECONDS);
     scheduler.scheduleAtFixedRate(this::abandonCheckRun, config.durationBetweenAbandonCheckRuns(), config.durationBetweenAbandonCheckRuns(), TimeUnit.MILLISECONDS);
     log.info("Pool - {} created with maxPoolSize: {}, minPoolSize: {}", config.poolName(), config.maxPoolSize(), config.minPoolSize());
-    if (config.minPoolSize() > 0) {
-      for (int i = 0; i < config.minPoolSize(); i++) {
-        idleObjects.add(createObject());
-        currentPoolSize.incrementAndGet();
-      }
-    }
+    ensureMinIdle();
   }
 
 
@@ -67,87 +59,48 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
 
   }
 
-
-  /**
-   * Returns the configuration used by this object pool.
-   *
-   * @return the configuration used by this object pool
-   */
-  public SimpleObjectPoolConfig config() {
-    return config;
-  }
-
   /**
    * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
    * This method is called periodically when pool size is greater than minPoolSize.
    * Evicted objects are destroyed using the objectFactory.
    */
-  private void evictionRun() {
+  private void evictionRun(boolean testAll) {
     if (config.evictionPolicy() == SimpleObjectPoolConfig.EvictionPolicy.NONE) {
       return;
     }
-    List<PooledObject<T>> objectsToDestroy = new ArrayList<>();
-    // Only run eviction if we have more idle objects than minimum required
-    final var size = idleObjects.size();
+
+    // Capture the current size of idle objects to determine the batch size for this run.
+    // This snapshot prevents processing newly returned objects in the same run if they flood in.
+    int size = idleObjects.size();
     if (size < 1) {
+      // Even if empty, we might need to ensure min idle, BUT standard pool behavior usually
+      // does min idle check *after* potential evictions.
+      // However, if it's empty, we just skip to the min-idle check at the end.
+      ensureMinIdle();
       return;
     }
-    // Get the number of objects to test in this run
-    int numToTest = Math.min(config.numValidationsPerEvictionRun(), size);
+
+    // Determine how many objects to test in this run
+    // If testAll is true (manual evict()), test all idle objects
+    // Otherwise, limit to configured numValidationsPerEvictionRun
+    int numToTest = testAll ? size : Math.min(config.numValidationsPerEvictionRun(), size);
+
+    List<PooledObject<T>> objectsToDestroy = new ArrayList<>();
 
     try {
       lock.lock();
-      // Select objects based on eviction policy
-      List<PooledObject<T>> objectsForTest = null;
-      switch (config.evictionPolicy()) {
-        case RANDOM -> {
-          objectsForTest = new ArrayList<>(idleObjects);
-        }
-        case OLDEST_FIRST -> {
-          objectsForTest = idleObjects.stream()
-                                      .sorted(Comparator.comparingLong(PooledObject::creationTime))
-                                      .toList();
-        }
-        case LEAST_USED -> {
-          // Sort by usage count and take the least used
-          objectsForTest = idleObjects.stream()
-                                      .sorted(Comparator.comparingLong(PooledObject::borrowCount))
-                                      .toList();
-        }
-        case MOST_USED -> {
-          // Sort by usage count and take the most used
-          objectsForTest = idleObjects.stream()
-                                      .sorted((o1, o2) -> Long.compare(o2.borrowCount(), o1.borrowCount()))
-                                      .toList();
-        }
-      }
+      List<PooledObject<T>> objectsForTest = selectEvictionCandidates(numToTest);
 
-      // Test selected objects
       for (var pooledObject : objectsForTest) {
-        boolean shouldEvict = false;
-        // Check if object is idle for too long
-        if (pooledObject.idlingTime() > config.objEvictionTimeout()) {
-          shouldEvict = true;
-        } else if (config.testWhileIdle()) {
-          if (numToTest <= 0) break;
-          try {
-            numToTest--;
-            if (!factory.isObjectValid(pooledObject.object())) {
-              shouldEvict = true;
-            }
-          } catch (Exception e) {
-            log.warn("Object validation failed with error for object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
-            shouldEvict = true;
-          }
-        }
-
-        if (shouldEvict) {
+        if (shouldEvict(pooledObject)) {
+          // Remove from the main idle queue if it's still there
           if (idleObjects.remove(pooledObject)) {
             currentPoolSize.decrementAndGet();
+            notEmpty.signal();
+            objectsToDestroy.add(pooledObject);
           } else {
-            log.error("Failed to remove object with id {} from idle queue", pooledObject.id());
+            log.error("Possible memory leak: Object not found in idle queue when evicting: id={}, pool={}", pooledObject.id(), config.poolName());
           }
-          objectsToDestroy.add(pooledObject);
         }
       }
 
@@ -157,57 +110,121 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       lock.unlock();
     }
 
-    // Destroy collected objects outside the critical section
-    for (PooledObject<T> pooledObject : objectsToDestroy) {
-      try {
-        factory.destroyObject(pooledObject.object());
-        log.debug("Destroying object during eviction run with id {}, " +
-                  "created {} ago, " +
-                  "idling for {}ms " +
-                  "used {} time(s), ",
-                  pooledObject.id(),
-                  Duration.ofMillis(System.currentTimeMillis() - pooledObject.creationTime()),
-                  pooledObject.idlingTime(), pooledObject.borrowCount());
-      } catch (Exception e) {
-        log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
+    // Destroy collected objects outside of lock (best practice to avoid holding lock during I/O or long ops)
+    for (PooledObject<T> p : objectsToDestroy) {
+      destroyPooledObject(p);
+      log.debug("Evicted and destroyed object: id={}, idleTime={}ms", p.id(), p.idlingTime());
+    }
+
+    // Ensure min pool size
+    ensureMinIdle();
+  }
+
+  private List<PooledObject<T>> selectEvictionCandidates(int numToTest) {
+    List<PooledObject<T>> objectsForTest = null;
+    switch (config.evictionPolicy()) {
+      case RANDOM -> {
+        objectsForTest = new ArrayList<>(idleObjects);
+        if (objectsForTest.size() > numToTest) {
+          // This sublist logic is a bit weak for "Random" but consistent with previous "test all".
+          // Previous code tested *all* if policy was random (copied list).
+          // Let's just take the first N for efficiency if we are limiting.
+          objectsForTest = objectsForTest.subList(0, numToTest);
+        }
+      }
+      case OLDEST_FIRST -> {
+        objectsForTest = idleObjects.stream()
+                                    .sorted(Comparator.comparingLong(PooledObject::creationTime))
+                                    .limit(numToTest)
+                                    .toList();
+      }
+      case LEAST_USED -> {
+        objectsForTest = idleObjects.stream()
+                                    .sorted(Comparator.comparingLong(PooledObject::borrowCount))
+                                    .limit(numToTest)
+                                    .toList();
+      }
+      case MOST_USED -> {
+        objectsForTest = idleObjects.stream()
+                                    .sorted((o1, o2) -> Long.compare(o2.borrowCount(), o1.borrowCount()))
+                                    .limit(numToTest)
+                                    .toList();
       }
     }
 
-    if (!objectsToDestroy.isEmpty()) {
-      log.debug("Evicted {} idle objects in pool - {}. Current pool size: {}, Idle: {}, Borrowed: {}",
-                objectsToDestroy.size(), config.poolName(), currentPoolSize(), idleObjectCount(), borrowedObjectsCount());
-      objectsToDestroy.clear();
+    if (objectsForTest == null) {
+      // Fallback or SHOULD NOT HAPPEN.
+      objectsForTest = new ArrayList<>();
     }
+    return objectsForTest;
+  }
+
+  private boolean shouldEvict(PooledObject<T> pooledObject) {
+    // 1. Idle Eviction Check
+    // If object is idle for too long, mark for eviction.
+    if (pooledObject.idlingTime() > config.objEvictionTimeout()) {
+      return true;
+    } else if (config.testWhileIdle()) {
+      // 2. Validation (Test While Idle)
+      // Only test if not already evicted.
+      // Standard lifecycle: activate -> validate -> passivate
+      boolean active = false;
+      try {
+        factory.activateObject(pooledObject.object());
+        active = true;
+        if (!factory.isObjectValid(pooledObject.object())) {
+          return true;
+        }
+      } catch (Exception e) {
+        log.warn("Object failed validation/activation during eviction check: id={}, pool={}", pooledObject.id(), config.poolName(), e);
+        return true;
+      } finally {
+        if (active) {
+          try {
+            factory.passivateObject(pooledObject.object());
+          } catch (Exception e) {
+            log.warn("Object failed passivation during eviction check: id={}, pool={}", pooledObject.id(), config.poolName(), e);
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   /**
-   * Destroys all idle objects in the pool.
-   * This method removes and destroys all objects from the idle queue,
-   * regardless of the minimum pool size or idle time.
+   * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
+   * This method is called periodically when pool size is greater than minPoolSize.
+   * Evicted objects are destroyed using the objectFactory.
    */
-  public void destroyAllIdleObjects() {
-    try {
-      lock.lock();
-      // Collect all idle objects for destruction
-      var objectsToDestroy = new ArrayList<>(idleObjects);
-      idleObjects.clear();
-      currentPoolSize.addAndGet(Math.negateExact(objectsToDestroy.size()));
 
-      // Destroy collected objects
-      for (PooledObject<T> pooledObject : objectsToDestroy) {
-        log.debug("Destroying idle object with id {}.", pooledObject.id());
+  private void ensureMinIdle() {
+    if (config.minPoolSize() > 0 && idleObjects.size() < config.minPoolSize() && currentPoolSize.get() < config.maxPoolSize()) {
+      int diff = config.minPoolSize() - idleObjects.size();
+      // We should verify we don't exceed maxPoolSize while filling
+      // It's possible currentPoolSize > idleObjects.size() (borrowed objects exist)
+      // We can only add if currentPoolSize < maxPoolSize.
+      // Safe looping:
+      for (int i = 0; i < diff; i++) {
+        if (currentPoolSize.get() >= config.maxPoolSize()) {
+          break;
+        }
+        creationLock.lock();
         try {
-          factory.destroyObject(pooledObject.object());
+          if (currentPoolSize.get() >= config.maxPoolSize()) {
+            break;
+          }
+          // We are in a scheduled thread, not blocking a user request, so standard create is fine?
+          // createObject increments currentPoolSize and adds to valid creation counts inside the method or caller?
+          createAndAddIdleObject();
         } catch (Exception e) {
-          log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
+          log.warn("Failed to create object to maintain minPoolSize", e);
+          // If creation fails, waiting a bit or aborting this run is safer than tight loop spinning.
+          break;
+        } finally {
+          creationLock.unlock();
         }
       }
-      log.info("Destroyed {} idle objects. Current pool size: {}",
-               objectsToDestroy.size(), currentPoolSize());
-    } catch (Exception e) {
-      log.error("Error destroying all idle objects", e);
-    } finally {
-      lock.unlock();
     }
   }
 
@@ -228,7 +245,8 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       });
 
       for (PooledObject<T> pooledObject : objectsToRemove) {
-        log.warn("Removing abandoned object with id {} in pool - {}. It has been borrowed for more than {} ms and destroying it.", pooledObject.id(), config.poolName(), now - pooledObject.lastBorrowedTime());
+        log.warn("Removing abandoned object with id {} in pool - {}. It has been borrowed for more than {} ms and destroying it.", pooledObject.id(), config.poolName(),
+                 now - pooledObject.lastBorrowedTime());
         removeAndDestroyBorrowedObjects(pooledObject);
       }
     } catch (Exception e) {
@@ -246,12 +264,44 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
   private void removeAndDestroyBorrowedObjects(PooledObject<T> pooledObject) {
     if (borrowedObjects.remove(pooledObject.id()) != null) {
       currentPoolSize.decrementAndGet();
+      notEmpty.signal();
     }
+    destroyPooledObject(pooledObject);
+  }
+
+
+  private void createAndAddIdleObject() {
+    PooledObject<T> p = createObject();
+    idleObjects.add(p);
+    currentPoolSize.incrementAndGet();
+  }
+
+  private void destroyPooledObject(PooledObject<T> pooledObject) {
+    if (pooledObject != null) {
+      destroyPoolObject(pooledObject.object());
+    }
+  }
+
+  private void destroyPoolObject(T object) {
     try {
-      factory.destroyObject(pooledObject.object());
+      factory.destroyObject(object);
     } catch (Exception e) {
-      log.warn("Failed to destroy object with id {} in pool - {}", pooledObject.id(), config.poolName(), e.getCause());
+      log.warn("Failed to destroy object with id {} in pool - {}", object.getEntityId(), config.poolName(), e);
     }
+  }
+
+  private boolean isValidForBorrow(PooledObject<T> pooledObject) {
+    final var object = pooledObject.object();
+    if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
+      // Object is invalid before it has been added to borrowedObjects or
+      // returned to the idle queue. We must destroy it and adjust the
+      // pool size, regardless of whether it was newly created or taken
+      // from idle.
+      currentPoolSize.decrementAndGet();
+      destroyPoolObject(object);
+      return false;
+    }
+    return true;
   }
 
   private PooledObject<T> createObject() {
@@ -268,6 +318,67 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
       }
     }
     return pooledObject;
+  }
+
+  /**
+   * Returns the configuration used by this object pool.
+   *
+   * @return the configuration used by this object pool
+   */
+  public SimpleObjectPoolConfig config() {
+    return config;
+  }
+
+  /**
+   * Performs eviction of idle objects from the pool.
+   * <p>
+   * This method can be called manually to trigger an eviction run outside of the
+   * scheduled eviction cycle. It examines idle objects and evicts those that:
+   * <ul>
+   *   <li>Have been idle longer than {@link SimpleObjectPoolConfig#objEvictionTimeout()}</li>
+   *   <li>Fail validation if {@link SimpleObjectPoolConfig#testWhileIdle()} is enabled</li>
+   * </ul>
+   * </p>
+   * <p>
+   * The number of objects examined is determined by
+   * {@link SimpleObjectPoolConfig#numValidationsPerEvictionRun()}.
+   * </p>
+   * <p>
+   * After eviction, the pool will attempt to maintain the minimum idle pool size
+   * by creating new objects if necessary.
+   * </p>
+   *
+   * @throws Exception if an error occurs during eviction
+   */
+  public void evict() throws Exception {
+    evictionRun(true); // Test all idle objects when manually invoked
+  }
+
+  /**
+   * Destroys all idle objects in the pool.
+   * This method removes and destroys all objects from the idle queue,
+   * regardless of the minimum pool size or idle time.
+   */
+  public void destroyAllIdleObjects() {
+    try {
+      lock.lock();
+      // Collect all idle objects for destruction
+      var objectsToDestroy = new ArrayList<>(idleObjects);
+      idleObjects.clear();
+      currentPoolSize.addAndGet(Math.negateExact(objectsToDestroy.size()));
+
+      // Destroy collected objects
+      for (PooledObject<T> pooledObject : objectsToDestroy) {
+        log.debug("Destroying idle object with id {}.", pooledObject.id());
+        destroyPooledObject(pooledObject);
+      }
+      log.info("Destroyed {} idle objects. Current pool size: {}",
+               objectsToDestroy.size(), currentPoolSize());
+    } catch (Exception e) {
+      log.error("Error destroying all idle objects", e);
+    } finally {
+      lock.unlock();
+    }
   }
 
   /**
@@ -294,11 +405,10 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
         throw new PoolTimeoutException("Timeout waiting to acquire lock to borrow object");
       }
       remainingNanos = waitTimeout - (System.nanoTime() - startTime);
-      boolean createdObject = false;
       do {
         // First try to get from idle objects
-        pooledObject  = idleObjects.poll();
-        createdObject = false;
+        boolean newlyCreated = false;
+        pooledObject = idleObjects.poll();
         if (pooledObject == null) {
           // Try to create new, if pool is not full
           if (borrowedObjects.size() < config.maxPoolSize()) {
@@ -320,9 +430,17 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
             }
 
             try {
-              pooledObject  = createObject();
-              createdObject = true;
-              retriesLeft--;
+              creationLock.lock();
+              try {
+                if (currentPoolSize.get() < config.maxPoolSize()) {
+                  pooledObject = createObject();
+                  newlyCreated = true;
+                  currentPoolSize.incrementAndGet();
+                  retriesLeft--;
+                }
+              } finally {
+                creationLock.unlock();
+              }
             } catch (Exception e) {
               if (e instanceof PoolObjectValidationException) {
                 log.error("", e);
@@ -346,24 +464,31 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
           }
         }
 
-        // Validate object before borrowing if configured
-        final var object = pooledObject.object();
-        if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
-          removeAndDestroyBorrowedObjects(pooledObject);
+        if (!isValidForBorrow(pooledObject)) {
           continue;
         }
 
 
         // Object is valid, prepare for borrowing
-        pooledObject.borrow();
-        factory.activateObject(object);
-        borrowedObjects.put(pooledObject.id(), pooledObject);
-        if (createdObject) currentPoolSize.incrementAndGet();
-        timesBorrowed.incrementAndGet();
-        notEmpty.signal();
-        log.trace("Resource borrowed - id: {}, current pool size: {}",
-                  pooledObject.id(), currentPoolSize.get());
-        return object;
+        final var object = pooledObject.object();
+        try {
+          pooledObject.borrow();
+          if (!newlyCreated) {
+             factory.activateObject(object);
+          }
+          borrowedObjects.put(pooledObject.id(), pooledObject);
+          timesBorrowed.incrementAndGet();
+          notEmpty.signal();
+          log.trace("Resource borrowed - id: {}, current pool size: {}",
+                    pooledObject.id(), currentPoolSize.get());
+          return object;
+        } catch (Exception e) {
+          log.warn("Failed to activate object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
+          currentPoolSize.decrementAndGet();
+          destroyPoolObject(object);
+          // Continue the loop to try getting another object
+          continue;
+        }
       } while (remainingNanos > 0);
 
       throw new PoolTimeoutException("Timeout waiting for an available object to borrow");
@@ -382,6 +507,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    *
    * @param obj    The object to return to the pool
    * @param broken Flag indicating if the object is in a broken state
+   *
    * @throws PoolObjectException if object validation fails
    */
   public void returnObject(T obj, boolean broken) throws PoolObjectException {
@@ -439,6 +565,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    * Returns a borrowed object back to the pool.
    *
    * @param obj The object to return to the pool
+   *
    * @throws PoolObjectException if object validation fails
    */
   public void returnObject(T obj) throws PoolObjectException {
@@ -565,6 +692,7 @@ public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
    * If you need to check, check only for borrowed objects.
    *
    * @param objectId the id of the object to query, may be null
+   *
    * @return the number of times the object has been borrowed
    */
   public long numOfTimesBorrowed(Long objectId) {
