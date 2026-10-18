@@ -21,8 +21,9 @@ import static today.bonfire.oss.sop.TestSupport.assertNeverDuring;
 import static today.bonfire.oss.sop.TestSupport.awaitUntil;
 
 /**
- * Behaviour the v3 pool must have so it can replace commons-pool2 in Jedis. Tests 1 to 10 follow
- * section 6 of jedis-v8-sop-requirements.md; the rest cover new v3 API.
+ * Lifecycle guarantees of the v3 pool: no destruction of borrowed objects by default, graceful
+ * close, no factory I/O under pool locks, isolation of objects under idle test, single creation
+ * attempt by default, identity tracking, bounded thread use, and the new v3 API surface.
  */
 @Timeout(30)
 class SimpleObjectPoolV3RequirementsTest {
