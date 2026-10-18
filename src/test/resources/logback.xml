@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
-    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %-20.20logger{5} : %msg%n%ex{short}</pattern>
+    <import class="ch.qos.logback.classic.encoder.PatternLayoutEncoder"/>
+    <import class="ch.qos.logback.core.ConsoleAppender"/>
+
+    <appender name="STDOUT" class="ConsoleAppender">
+        <encoder class="PatternLayoutEncoder">
+            <pattern>%black(%d{yyMMddHHmmss}) %highlight(%-5level) %magenta([%thread] %-16.16logger{5}) %yellow(%X{uid:-ND}) : %boldCyan(%msg%n%ex{short})</pattern>
         </encoder>
     </appender>
 
@@ -11,4 +14,5 @@
     <root level="INFO">
         <appender-ref ref="STDOUT"/>
     </root>
+
 </configuration>
