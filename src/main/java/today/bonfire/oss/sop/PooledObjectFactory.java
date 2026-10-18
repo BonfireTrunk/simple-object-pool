@@ -1,77 +1,90 @@
 package today.bonfire.oss.sop;
 
 /**
- * Provides a factory for creating pooled objects.
- * Implementations should provide a concrete type of T that implements the
- * {@link PoolObject} interface.
+ * Creates, validates and destroys the objects managed by a {@link SimpleObjectPool}.
+ * <p>
+ * Only {@link #createObject()} and {@link #destroyObject(Object)} are required. The other
+ * methods have no-op or always-valid defaults so a minimal factory is two methods.
+ * <p>
+ * The pool never holds a lock that borrowers or returners contend while calling any method on
+ * this interface, so implementations may perform blocking I/O. Each method is called from at most
+ * one thread at a time for a given object. Blocking calls must have their own timeouts: a
+ * {@code createObject} that never returns holds a capacity slot forever.
  *
- * @param <T> the type of object to be pooled, must implement {@link PoolObject}
+ * @param <T> the type of object to be pooled
  */
-public interface PooledObjectFactory<T extends PoolObject> {
+public interface PooledObjectFactory<T> {
 
   /**
-   * Creates an instance of the pooled object.
-   * This method is responsible for instantiating and initializing
-   * a new object of type T that implements the {@link PoolObject} interface.
-   * Implementations should handle any exceptions gracefully.
+   * Creates a new object. Called with no pool lock held. Any exception thrown propagates
+   * unchanged to the caller of {@link SimpleObjectPool#borrowObject()} once creation
+   * retries are exhausted.
    *
-   * @return a newly created object of type T, never null.
+   * @return a new object, never null
    */
   T createObject();
 
-
   /**
-   * Activates the pooled object.
-   * This method is called when the object is taken from the pool
-   * and is responsible for any necessary activation or initialization setting before borrowing.
+   * Releases any resources held by the object. Called exactly once per object, from the
+   * thread that removed it from the pool. Exceptions are logged and swallowed.
    *
-   * @param obj the object to activate, must not be null.
-   */
-  void activateObject(T obj);
-
-
-  /**
-   * Passivates the pooled object.
-   * This method is called when the object is being returned to the pool
-   * and is responsible for any necessary passivation or cleaning-up before returning to pool.
-   *
-   * @param obj the object to passivate, must not be null.
-   */
-  void passivateObject(T obj);
-
-  /**
-   * Validates the pooled object to determine if it can be safely borrowed.
-   * This method should return true if the object is in a valid state for
-   * reuse in the pool, and false if the object should be discarded.
-   * This method should return very quickly and non-blocking,
-   * you may set a much extensive/expensive check in {@link #isObjectValid(T)}
-   *
-   * @param obj the object to validate, must not be null.
-   * @return {@code true} if the object is valid and can be reused,
-   * {@code false} otherwise.
-   */
-  boolean isObjectValidForBorrow(T obj);
-
-  /**
-   * Checks if the pooled object is still valid.
-   * This method should return true if the object is in a valid state,
-   * and false if the object should be discarded.
-   *
-   * @param obj the object to check, must not be null.
-   * @return {@code true} if the object is valid,
-   * {@code false} otherwise.
-   */
-  boolean isObjectValid(T obj);
-
-
-  /**
-   * Destroys the pooled object, performing any necessary cleanup operations.
-   * This method is called when the object is no longer needed and should
-   * release any resources held by the object, ensuring that it can be
-   * garbage collected. Implementations should handle any exceptions gracefully.
-   *
-   * @param obj the object to destroy, must not be null.
+   * @param obj the object to destroy
    */
   void destroyObject(T obj);
 
+  /**
+   * Prepares an object that is about to be handed to a borrower. Called on every borrow of an
+   * existing idle object, and before each validation during an idle test. An exception marks
+   * the object invalid and it is destroyed.
+   *
+   * @param obj the object to activate
+   */
+  default void activateObject(T obj) {
+  }
+
+  /**
+   * Resets an object that is being returned to the idle queue, and after each validation
+   * during an idle test. An exception marks the object invalid and it is destroyed.
+   *
+   * @param obj the object to passivate
+   */
+  default void passivateObject(T obj) {
+  }
+
+  /**
+   * A cheap check run on borrow when {@link SimpleObjectPoolConfig#testOnBorrow()} is on.
+   * Returning false destroys the object and the borrower tries the next one.
+   * Keep this fast; put expensive checks in {@link #isObjectValid(Object)}.
+   *
+   * @param obj the object to check
+   * @return true if the object may be borrowed
+   */
+  default boolean isObjectValidForBorrow(T obj) {
+    return true;
+  }
+
+  /**
+   * A thorough check run on create ({@code testOnCreate}), on return ({@code testOnReturn})
+   * and during idle tests ({@code testWhileIdle}). Returning false destroys the object.
+   *
+   * @param obj the object to check
+   * @return true if the object is still usable
+   */
+  default boolean isObjectValid(T obj) {
+    return true;
+  }
+
+  /**
+   * A per-object eviction hook consulted for every idle object examined by an eviction run,
+   * before the idle-timeout rule and before validation. Returning true evicts the object
+   * regardless of idle time or {@code minPoolSize}. Use it to retire objects on external
+   * signals, for example a server asking clients to reconnect.
+   *
+   * @param obj  the idle object
+   * @param info the pool's bookkeeping for that object
+   * @return true to evict and destroy the object
+   */
+  default boolean shouldEvict(T obj, PooledObject<T> info) {
+    return false;
+  }
 }

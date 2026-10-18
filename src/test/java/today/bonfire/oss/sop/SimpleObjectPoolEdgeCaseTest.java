@@ -1,149 +1,220 @@
 package today.bonfire.oss.sop;
 
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.junit.jupiter.MockitoExtension;
+import org.junit.jupiter.api.Timeout;
+import today.bonfire.oss.sop.exceptions.PoolClosedException;
 import today.bonfire.oss.sop.exceptions.PoolException;
+import today.bonfire.oss.sop.exceptions.PoolObjectException;
 
 import java.time.Duration;
-import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.fail;
 
-@ExtendWith(MockitoExtension.class)
+@Timeout(30)
 class SimpleObjectPoolEdgeCaseTest {
 
-  private static final int  MAX_POOL_SIZE     = 5;
-  private static final int  MIN_POOL_SIZE     = 2;
-  private static final long IDLE_TIMEOUT      = 1000L;
-  private static final long ABANDONED_TIMEOUT = 2000L;
+  private static final int      MAX_POOL_SIZE = 5;
+  private static final Duration AWAIT         = Duration.ofSeconds(10);
 
   @Test
-  void testZeroIdleEvictionTimeout() throws Exception {
+  void testZeroIdleEvictionTimeout() {
     var factory = new TestPooledObjectFactory();
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
-                                                            .objEvictionTimeout(Duration.ZERO)
-                                                            .durationBetweenEvictionsRuns(Duration.ofMillis(100))
-                                                            .build(), factory);
+    // minPoolSize is 0: v3 never evicts below minPoolSize, so a zero idle timeout needs min 0 to take effect.
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(MAX_POOL_SIZE)
+                                                                 .minPoolSize(0)
+                                                                 .objEvictionTimeout(Duration.ZERO)
+                                                                 .durationBetweenEvictionsRuns(Duration.ofMillis(50))
+                                                                 .build(), factory)) {
+      TestPoolObject borrowed = pool.borrowObject();
+      pool.returnObject(borrowed);
 
-    TestPoolObject borrowed = pool.borrowObject();
-    pool.returnObject(borrowed);
+      TestSupport.awaitUntil("idle object evicted", AWAIT, () -> pool.idleObjectCount() == 0 && pool.currentPoolSize() == 0);
+      assertThat(borrowed.isDestroyed()).isTrue();
 
-    // Wait for multiple eviction runs
-    Thread.sleep(200);
-
-    // Borrow again should return the same object eviction is immediate
-    TestPoolObject borrowedAgain = pool.borrowObject();
-    assertThat(borrowedAgain).isNotEqualTo(borrowed);
-    pool.close();
+      TestPoolObject borrowedAgain = pool.borrowObject();
+      assertThat(borrowedAgain).isNotSameAs(borrowed);
+      assertThat(borrowedAgain.seq()).isNotEqualTo(borrowed.seq());
+    }
   }
 
   @Test
   void testBorrowInterruptedException() throws Exception {
     var factory = new TestPooledObjectFactory();
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
-                                                            .testWhileIdle(false)
-                                                            .testOnCreate(false)
-                                                            .testOnBorrow(false)
-                                                            .waitingForObjectTimeout(Duration.ofSeconds(1))
-                                                            .abandonedTimeout(Duration.ofSeconds(2))
-                                                            .build(), factory);
-
-    // First fill the pool to max capacity
-    var borrowed = new TestPoolObject[MAX_POOL_SIZE];
-    for (int i = 0; i < MAX_POOL_SIZE; i++) {
-      borrowed[i] = pool.borrowObject();
-    }
-
-    ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    CountDownLatch  latch    = new CountDownLatch(1);
-
-    Future<?> future = executor.submit(() -> {
-      try {
-        pool.borrowObject();
-        fail("Should have been interrupted");
-      } catch (PoolException e) {
-        latch.countDown();
-        assertThat(e.getMessage()).isEqualTo("Thread interrupted while attempting to borrow object");
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(MAX_POOL_SIZE)
+                                                                 .waitingForObjectTimeout(Duration.ofSeconds(20))
+                                                                 .build(), factory)) {
+      var borrowed = new TestPoolObject[MAX_POOL_SIZE];
+      for (int i = 0; i < MAX_POOL_SIZE; i++) {
+        borrowed[i] = pool.borrowObject();
       }
-    });
 
-    Thread.sleep(100);
-    future.cancel(true);
-    executor.shutdownNow();
+      AtomicReference<Throwable> thrown            = new AtomicReference<>();
+      AtomicReference<Boolean>   interruptRestored = new AtomicReference<>();
+      Thread t = Thread.ofVirtual().start(() -> {
+        try {
+          pool.borrowObject();
+        } catch (Throwable e) {
+          thrown.set(e);
+          interruptRestored.set(Thread.currentThread().isInterrupted());
+        }
+      });
 
-    assertThat(latch.await(2, TimeUnit.SECONDS))
-        .as("Interrupted exception should have been thrown")
-        .isTrue();
-    assertThat(executor.awaitTermination(1, TimeUnit.SECONDS))
-        .as("Executor should terminate")
-        .isTrue();
+      TestSupport.awaitUntil("borrower parked", AWAIT, () -> pool.waitingCount() == 1);
+      t.interrupt();
+      t.join(10_000);
 
-    // Cleanup
-    for (var obj : borrowed) {
-      pool.returnObject(obj);
+      assertThat(t.isAlive()).isFalse();
+      assertThat(thrown.get()).isInstanceOf(PoolException.class)
+                              .hasCauseInstanceOf(InterruptedException.class);
+      assertThat(thrown.get().getMessage()).contains("Interrupted");
+      assertThat(interruptRestored.get()).as("interrupt flag restored").isTrue();
+      assertThat(pool.waitingCount()).isZero();
+
+      for (var obj : borrowed) {
+        pool.returnObject(obj);
+      }
     }
-    pool.close();
   }
 
   @Test
-  void testObjectValidationFailureDuringBorrowAfterIdle() {
+  void testObjectValidationFailureDuringBorrowAfterIdle() throws Exception {
     var factory = new TestPooledObjectFactory();
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(0)
-                                                            .maxRetries(2)
-                                                            .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.NONE)
-                                                            .waitingForObjectTimeout(Duration.ofSeconds(1000))
-                                                            .testWhileIdle(true)
-                                                            .testOnBorrow(true)
-                                                            .build(), factory);
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(MAX_POOL_SIZE)
+                                                                 .maxRetries(2)
+                                                                 .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.NONE)
+                                                                 .testOnBorrow(true)
+                                                                 .build(), factory)) {
+      TestPoolObject borrowed = pool.borrowObject();
+      pool.returnObject(borrowed);
 
-    // Borrow and return an object
-    TestPoolObject borrowed = pool.borrowObject();
-    pool.returnObject(borrowed);
+      factory.setFailValidationForBorrow(true);
 
-    // Set validation to fail before next borrow
-    factory.setFailValidationForBorrow(true);
+      // v3: validation on borrow applies to idle objects only. The invalid idle object is destroyed
+      // and a fresh one (not re-validated) is handed out, so the borrow succeeds.
+      TestPoolObject next = pool.borrowObject();
 
-    // Next borrow should fail validation and throw exception
-    assertThatThrownBy(() -> pool.borrowObject())
-        .isInstanceOf(PoolException.class);
-
-    assertThat(factory.getValidationForBorrowFailCount().get())
-        .as("Validation should fail exactly once during borrow")
-        .isEqualTo(1 + 1 + 2); // 1 for existing object, 1 for first time creation and 2 for retries
-
-    pool.close();
+      assertThat(factory.getValidationForBorrowFailCount().get())
+          .as("Only the single idle object is validated")
+          .isEqualTo(1);
+      assertThat(borrowed.isDestroyed()).isTrue();
+      assertThat(next).isNotSameAs(borrowed);
+      assertThat(pool.currentPoolSize()).isEqualTo(1);
+      pool.returnObject(next);
+    }
   }
 
   @Test
-  void testReturnSameObjectTwice() throws Exception {
+  void testReturnSameObjectTwice() {
     var factory = new TestPooledObjectFactory();
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(2)
-                                                            .minPoolSize(0)
-                                                            .testOnCreate(false)
-                                                            .testOnReturn(false)
-                                                            .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.NONE)
-                                                            .build(), factory);
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(2)
+                                                                 .evictionPolicy(SimpleObjectPoolConfig.EvictionPolicy.NONE)
+                                                                 .build(), factory)) {
+      TestPoolObject borrowed = pool.borrowObject();
+      pool.returnObject(borrowed);
 
-    TestPoolObject borrowed = pool.borrowObject();
-    pool.returnObject(borrowed);
+      // v3: a second return is rejected instead of silently ignored.
+      assertThatThrownBy(() -> pool.returnObject(borrowed)).isInstanceOf(PoolObjectException.class);
 
-    // Second return of same object should be ignored
-    pool.returnObject(borrowed);
-
-    // Should return same object as it's still valid and in the pool
-    TestPoolObject borrowedAgain = pool.borrowObject();
-    assertThat(borrowedAgain).isSameAs(borrowed);
-    pool.close();
+      assertThat(pool.idleObjectCount()).isEqualTo(1);
+      TestPoolObject borrowedAgain = pool.borrowObject();
+      assertThat(borrowedAgain).isSameAs(borrowed);
+    }
   }
 
+  @Test
+  void testReturnForeignObjectRejected() {
+    var factory = new TestPooledObjectFactory();
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(2).build(), factory)) {
+      assertThatThrownBy(() -> pool.returnObject(new TestPoolObject())).isInstanceOf(PoolObjectException.class);
+    }
+  }
+
+  @Test
+  void testBorrowAfterCloseThrows() {
+    var factory = new TestPooledObjectFactory();
+    var pool    = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(2).build(), factory);
+    pool.close();
+    assertThat(pool.isClosed()).isTrue();
+    assertThatThrownBy(pool::borrowObject).isInstanceOf(PoolClosedException.class);
+  }
+
+  @Test
+  void testCloseDestroysIdleAndBorrowedOnReturn() {
+    var factory = new TestPooledObjectFactory();
+    var pool    = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(3).build(), factory);
+
+    TestPoolObject kept = pool.borrowObject();
+    TestPoolObject idle = pool.borrowObject();
+    pool.returnObject(idle);
+
+    pool.close();
+    assertThat(idle.isDestroyed()).as("idle destroyed on close").isTrue();
+    assertThat(kept.isDestroyed()).as("borrowed survives close").isFalse();
+
+    pool.returnObject(kept);
+    assertThat(kept.isDestroyed()).as("borrowed destroyed on return").isTrue();
+    assertThat(pool.currentPoolSize()).isZero();
+  }
+
+  @Test
+  void testForceCloseDestroysBorrowed() {
+    var factory = new TestPooledObjectFactory();
+    var pool    = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(3).build(), factory);
+
+    TestPoolObject kept = pool.borrowObject();
+    pool.forceClose();
+
+    assertThat(kept.isDestroyed()).isTrue();
+    assertThat(pool.currentPoolSize()).isZero();
+  }
+
+  @Test
+  void testConstructorCreatesNothingAndPrepareFillsMinPoolSize() {
+    var factory = new TestPooledObjectFactory();
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(4).minPoolSize(2).build(), factory)) {
+      assertThat(factory.getIdCounter().get()).isZero();
+      assertThat(pool.prepare()).isEqualTo(2);
+      assertThat(pool.idleObjectCount()).isEqualTo(2);
+      assertThat(pool.addObjects(10)).as("capped at maxPoolSize").isEqualTo(2);
+      assertThat(pool.currentPoolSize()).isEqualTo(4);
+    }
+  }
+
+  @Test
+  void testAbandonedObjectDestroyedWhenDetectionEnabled() throws Exception {
+    var factory = new TestPooledObjectFactory();
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(2)
+                                                                 .waitingForObjectTimeout(Duration.ofMillis(50))
+                                                                 .abandonedTimeout(Duration.ofMillis(100))
+                                                                 .durationBetweenAbandonCheckRuns(Duration.ofMillis(50))
+                                                                 .build(), factory)) {
+      TestPoolObject leaked = pool.borrowObject();
+      TestSupport.awaitUntil("abandoned object destroyed", AWAIT, leaked::isDestroyed);
+      assertThat(pool.borrowedObjectsCount()).isZero();
+      // The holder returning a reclaimed object is tolerated silently, like commons-pool2.
+      assertThatCode(() -> pool.returnObject(leaked)).doesNotThrowAnyException();
+      assertThat(pool.currentPoolSize()).isZero();
+      // But a second return of the same object is a genuine foreign return.
+      assertThatThrownBy(() -> pool.returnObject(leaked)).isInstanceOf(PoolObjectException.class);
+    }
+  }
+
+  @Test
+  void testAbandonDetectionOffByDefault() {
+    var factory = new TestPooledObjectFactory();
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(2).build(), factory)) {
+      assertThat(pool.config().abandonedTimeout()).isNull();
+      TestPoolObject held = pool.borrowObject();
+      TestSupport.assertNeverDuring("held object destroyed", Duration.ofMillis(300), held::isDestroyed);
+      pool.returnObject(held);
+    }
+  }
 }

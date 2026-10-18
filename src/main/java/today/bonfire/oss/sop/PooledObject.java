@@ -1,159 +1,143 @@
 package today.bonfire.oss.sop;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Represents a wrapper for pooled objects that maintains state information about the object's usage.
- * This class tracks whether an object is borrowed, broken, or idle, and manages its usage timestamps.
+ * Wrapper the pool keeps around every pooled object. It records lifecycle timestamps and
+ * usage counters and is what the factory's {@link PooledObjectFactory#shouldEvict} hook and
+ * the pool's statistics expose.
+ * <p>
+ * Instances are compared by identity. The pool never calls {@code equals} or {@code hashCode}
+ * on the wrapped object.
  *
- * @param <T> The type of the pooled object, must implement PoolObject for proper identification
+ * @param <T> the type of the pooled object
  */
-public class PooledObject<T extends PoolObject> {
-  private final    T       object;
-  private final    long    creationTime;
-  private volatile long    lastBorrowedTime;
-  private volatile long    idleFromTime;
-  private volatile boolean broken;
-  private volatile boolean borrowed;
-  private          long    timesBorrowed;
+public final class PooledObject<T> {
 
-  /**
-   * Creates a new PooledObject wrapping the given object with a specified ID.
-   * Initializes the object in an idle, non-broken state with current timestamp.
-   *
-   * @param object The object to be pooled
-   * @param id     The unique identifier to assign to this pooled entity
-   */
-  PooledObject(T object, Long id) {
-    Objects.requireNonNull(object, "Pool object cannot be null");
-    this.object = object;
-    object.setEntityId(id);
-    this.creationTime = System.currentTimeMillis();
-    this.idleFromTime = this.creationTime;
-    this.borrowed     = false;
-    this.broken       = false;  // Initialize broken state
+  /** Where an object is in its lifecycle. */
+  public enum State {
+    /** Available in the idle queue. */
+    IDLE,
+    /** Handed out to a caller. */
+    BORROWED,
+    /** Temporarily removed from the idle queue while the evictor validates it. */
+    TESTING,
+    /** Destroyed, or about to be. */
+    INVALID
   }
 
-  /**
-   * Returns the number of times this object has been borrowed from the pool.
-   *
-   * @return The number of times this object has been borrowed.
-   */
-  public long timesBorrowed() {
-    return timesBorrowed;
+  private final    T          object;
+  private final    long       id;
+  private final    long       creationTime;
+  private final    AtomicLong borrowCount = new AtomicLong();
+  private volatile long       lastBorrowedTime;
+  private volatile long       lastReturnedTime;
+  // Monotonic clock for every duration the pool acts on, so wall-clock steps (NTP) cannot
+  // make objects look abandoned or expired. The epoch-millis fields above are informational.
+  private volatile long       borrowedSinceNanos;
+  private volatile long       idleSinceNanos;
+  private volatile State      state       = State.IDLE;
+  private volatile boolean    broken;
+
+  PooledObject(T object, long id) {
+    this.object           = Objects.requireNonNull(object, "Pool object cannot be null");
+    this.id               = id;
+    this.creationTime     = System.currentTimeMillis();
+    this.lastReturnedTime = creationTime;
+    this.idleSinceNanos   = System.nanoTime();
   }
 
-  /**
-   * Returns the timestamp when this object was created.
-   *
-   * @return The creation timestamp in milliseconds.
-   */
-  public long creationTime() {
-    return creationTime;
-  }
-
-  /**
-   * Returns the timestamp when this object was last borrowed from the pool.
-   *
-   * @return The last borrowed timestamp in milliseconds.
-   */
-  public long lastBorrowedTime() {
-    return lastBorrowedTime;
-  }
-
-  /**
-   * Checks if this object is marked as broken.
-   *
-   * @return {@code true} if the object is broken, {@code false} otherwise.
-   */
-  public boolean isBroken() {
-    return broken;
-  }
-
-  /**
-   * Sets the broken state of this object.
-   *
-   * @param broken {@code true} if the object should be marked as broken, {@code false} otherwise.
-   */
-  public void broken(boolean broken) {
-    this.broken = broken;
-  }
-
-  /**
-   * Returns the underlying pooled object.
-   *
-   * @return The pooled object.
-   */
+  /** @return the wrapped object */
   public T object() {
     return object;
   }
 
-  /**
-   * Retrieves the entity ID of the wrapped object.
-   *
-   * @return The unique identifier of the wrapped object.
-   */
-  Long id() {
-    return object.getEntityId();
+  /** @return a pool-local sequence number, assigned at creation, useful in logs */
+  public long id() {
+    return id;
   }
 
-  /**
-   * Marks this object as borrowed and updates its last borrowed timestamp.
-   * This method should be called when the object is taken from the pool.
-   */
-  void borrow() {
-    borrowed         = true;
-    lastBorrowedTime = System.currentTimeMillis();
-    timesBorrowed++;
+  /** @return creation time in epoch milliseconds */
+  public long creationTime() {
+    return creationTime;
   }
 
-  /**
-   * Marks this object as idle and updates its idle timestamp.
-   * This method should be called when the object is returned to the pool.
-   */
-  void markIdle() {
-    borrowed     = false;
-    idleFromTime = System.currentTimeMillis();
+  /** @return the last time this object was borrowed, in epoch milliseconds, or 0 if never */
+  public long lastBorrowedTime() {
+    return lastBorrowedTime;
   }
 
-  /**
-   * Checks if this object has been abandoned by comparing its last borrowed time
-   * against the specified abandonment timeout.
-   *
-   * @param abandonmentTimeoutMillis The maximum allowed duration in milliseconds since the object was last borrowed.
-   * @return {@code true} if the object is considered abandoned, {@code false} otherwise.
-   */
-  boolean isAbandoned(long now, long abandonmentTimeoutMillis) {
-    return borrowed && ((now - lastBorrowedTime) >= abandonmentTimeoutMillis);
+  /** @return the last time this object became idle, in epoch milliseconds */
+  public long lastReturnedTime() {
+    return lastReturnedTime;
   }
 
-  /**
-   * Returns the duration in milliseconds that this object has been idle.
-   *
-   * @return The duration in milliseconds that this object has been idle.
-   */
-  public long idlingTime() {
-    return System.currentTimeMillis() - idleFromTime;
-  }
-
-  @Override
-  public int hashCode() {
-    return Long.hashCode(id());
-  }
-
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) return true;
-    if (!(o instanceof PooledObject<?> that)) return false;
-    return Objects.equals(id(), that.id());
-  }
-
-  /**
-   * Returns the number of times this object has been borrowed
-   *
-   * @return borrow count
-   */
+  /** @return how many times this object has been borrowed */
   public long borrowCount() {
-    return timesBorrowed;
+    return borrowCount.get();
+  }
+
+  /** @return milliseconds since this object last became idle (monotonic clock); meaningful only while idle */
+  public long idleTime() {
+    return (System.nanoTime() - idleSinceNanos) / 1_000_000L;
+  }
+
+  /** @return milliseconds since this object was last borrowed (monotonic clock); meaningful only while borrowed */
+  public long borrowedTime() {
+    return (System.nanoTime() - borrowedSinceNanos) / 1_000_000L;
+  }
+
+  long idleNanos() {
+    return System.nanoTime() - idleSinceNanos;
+  }
+
+  long borrowedNanos() {
+    return System.nanoTime() - borrowedSinceNanos;
+  }
+
+  /** @return the current lifecycle state */
+  public State state() {
+    return state;
+  }
+
+  /** @return whether a caller flagged this object as broken on return */
+  public boolean isBroken() {
+    return broken;
+  }
+
+  void markBorrowed() {
+    state              = State.BORROWED;
+    borrowedSinceNanos = System.nanoTime();
+    lastBorrowedTime   = System.currentTimeMillis();
+    borrowCount.incrementAndGet();
+  }
+
+  void markIdle() {
+    state            = State.IDLE;
+    idleSinceNanos   = System.nanoTime();
+    lastReturnedTime = System.currentTimeMillis();
+  }
+
+  void markTesting() {
+    state = State.TESTING;
+  }
+
+  /** Back to idle after an eviction test, without touching the idle timestamp. */
+  void markIdleAfterTest() {
+    state = State.IDLE;
+  }
+
+  void markInvalid() {
+    state = State.INVALID;
+  }
+
+  void markBroken() {
+    broken = true;
+  }
+
+  @Override
+  public String toString() {
+    return "PooledObject{id=" + id + ", state=" + state + ", borrows=" + borrowCount.get() + '}';
   }
 }

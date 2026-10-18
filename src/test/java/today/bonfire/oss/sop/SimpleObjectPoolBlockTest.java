@@ -1,17 +1,23 @@
 package today.bonfire.oss.sop;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import today.bonfire.oss.sop.exceptions.PoolClosedException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+@Timeout(30)
 class SimpleObjectPoolBlockTest {
 
+  private static final Duration AWAIT = Duration.ofSeconds(10);
+
   @Test
-  void testBlockWhenExhaustedFalse() throws Exception {
+  void testBlockWhenExhaustedFalse() {
     var factory = new TestPooledObjectFactory();
     var config = SimpleObjectPoolConfig.builder()
                                        .maxPoolSize(1)
@@ -22,40 +28,82 @@ class SimpleObjectPoolBlockTest {
       TestPoolObject obj1 = pool.borrowObject();
       assertThat(obj1).isNotNull();
 
-      // improved check: should fail immediately without waiting
-      long start = System.currentTimeMillis();
-      assertThatThrownBy(() -> pool.borrowObject())
+      // ZERO means fail fast: no parking, so no waiter is ever registered.
+      long start = System.nanoTime();
+      assertThatThrownBy(pool::borrowObject)
           .isInstanceOf(PoolTimeoutException.class)
-          .hasMessageContaining("Timeout waiting for available object");
-      long duration = System.currentTimeMillis() - start;
+          .hasMessageContaining("Timed out");
+      long durationMs = Duration.ofNanos(System.nanoTime() - start).toMillis();
 
-      // Should result in exception almost immediately, definitely less than default
-      // timeout (10s)
-      assertThat(duration).isLessThan(100);
+      // Generous bound (default wait is 10s); the point is that it did not wait.
+      assertThat(durationMs).isLessThan(2000);
+      assertThat(pool.waitingCount()).isZero();
     }
   }
 
   @Test
-  void testBlockWhenExhaustedTrue() throws Exception {
-    // Functional test for default blocking behavior is arguably covered by existing
-    // concurrency tests,
-    // but explicit test helps confirm flag is respected.
+  void testBlockWhenExhaustedTrue() {
     var factory = new TestPooledObjectFactory();
     var config = SimpleObjectPoolConfig.builder()
                                        .maxPoolSize(1)
-                                       .waitingForObjectTimeout(Duration.ofSeconds(1))
+                                       .waitingForObjectTimeout(Duration.ofMillis(500))
+                                       .build();
+
+    try (var pool = new SimpleObjectPool<>(config, factory)) {
+      pool.borrowObject();
+
+      long start = System.nanoTime();
+      assertThatThrownBy(pool::borrowObject).isInstanceOf(PoolTimeoutException.class);
+      long durationMs = Duration.ofNanos(System.nanoTime() - start).toMillis();
+
+      // Positive timeout: waited for (at least) the timeout before giving up.
+      assertThat(durationMs).isGreaterThanOrEqualTo(500);
+      assertThat(pool.waitingCount()).isZero();
+    }
+  }
+
+  @Test
+  void testNegativeTimeoutWaitsUntilObjectReturned() throws Exception {
+    var factory = new TestPooledObjectFactory();
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(1)
+                                       .waitingForObjectTimeout(Duration.ofSeconds(-1))
                                        .build();
 
     try (var pool = new SimpleObjectPool<>(config, factory)) {
       TestPoolObject obj1 = pool.borrowObject();
 
-      long start = System.currentTimeMillis();
-      assertThatThrownBy(() -> pool.borrowObject())
-          .isInstanceOf(PoolTimeoutException.class);
-      long duration = System.currentTimeMillis() - start;
+      CompletableFuture<TestPoolObject> waiter = CompletableFuture.supplyAsync(pool::borrowObject);
+      TestSupport.awaitUntil("borrower parked", AWAIT, () -> pool.waitingCount() == 1);
+      assertThat(waiter).isNotDone();
 
-      // Should wait for timeout
-      assertThat(duration).isGreaterThanOrEqualTo(1000);
+      pool.returnObject(obj1);
+      assertThat(waiter.get(10, java.util.concurrent.TimeUnit.SECONDS)).isSameAs(obj1);
+      TestSupport.awaitUntil("waiter count back to 0", AWAIT, () -> pool.waitingCount() == 0);
+    }
+  }
+
+  @Test
+  void testCloseWakesInfiniteWaiter() {
+    var factory = new TestPooledObjectFactory();
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(1)
+                                       .waitingForObjectTimeout(Duration.ofSeconds(-1))
+                                       .build();
+
+    var pool = new SimpleObjectPool<>(config, factory);
+    try {
+      pool.borrowObject();
+      CompletableFuture<TestPoolObject> waiter = CompletableFuture.supplyAsync(pool::borrowObject);
+      TestSupport.awaitUntil("borrower parked", AWAIT, () -> pool.waitingCount() == 1);
+
+      pool.close();
+
+      // v3: close() wakes parked borrowers and they fail with PoolClosedException.
+      assertThatThrownBy(() -> waiter.get(10, java.util.concurrent.TimeUnit.SECONDS))
+          .hasRootCauseInstanceOf(PoolClosedException.class);
+    } finally {
+      pool.forceClose();
     }
   }
 }

@@ -1,0 +1,102 @@
+# Changelog
+
+## 3.0.0
+
+A rewrite of the pool core. The public surface is similar, but the contract changed in several
+places, so this is a major version.
+
+### Breaking changes
+
+- **`PoolObject` interface removed.** `SimpleObjectPool<T>` accepts any type. Objects are tracked
+  by identity, the pool never calls `equals` or `hashCode` on them, and nothing is written onto
+  the pooled object. Remove `getEntityId` / `setEntityId` from your classes.
+- **`numOfTimesBorrowed(Long id)` is now `numOfTimesBorrowed(T obj)`.**
+- **Abandon detection is off by default.** Previously objects borrowed for more than 60 s were
+  destroyed. Set `abandonedTimeout(Duration)` to enable it. Zero or negative values disable it.
+- **The constructor no longer creates objects.** Call `prepare()` to fill to `minPoolSize`, or
+  `addObject()` / `addObjects(int)`. The first scheduled maintenance run also fills it.
+- **`maxRetries` defaults to 0.** A failing `createObject` reaches the borrower after one attempt,
+  with the factory's exception unchanged. Previously the default allowed up to three attempts
+  back to back.
+- **`close()` is graceful.** Idle objects are destroyed, threads waiting in `borrowObject()` are
+  woken and throw `PoolClosedException`, and borrowed objects are destroyed when returned. The
+  old behaviour of destroying borrowed objects immediately is `forceClose()`.
+- **Borrow after close throws `PoolClosedException`.** Previously it could create objects inside
+  a closed pool and leak them.
+- **Returning an object that is not borrowed from the pool throws `PoolObjectException`.**
+  Previously it logged a warning and returned. Returning an object the pool itself already
+  reclaimed (abandon detection or `forceClose`) is silently ignored.
+- **Idle order is LIFO by default.** Set `lifo(false)` for the previous round-robin behaviour.
+  With FIFO, under steady light load every idle object stayed warm and the pool never shrank.
+- **Config time getters return `Duration`** instead of `long` millis or nanos.
+- **`evict()` no longer declares `throws Exception`**, validates every idle object regardless of
+  `evictionPolicy`, and is safe to call from any thread while borrows and returns are in flight.
+  `EvictionPolicy.NONE` now only disables the scheduled run.
+- **`waitingForObjectTimeout` semantics:** negative waits forever, zero fails immediately,
+  positive is a bounded wait. Previously negative behaved like zero.
+- **Validation warnings removed** for `durationBetweenEvictionsRuns` versus
+  `waitingForObjectTimeout`. `abandonedTimeout` no longer rejects zero.
+- **Lombok is no longer on the classpath** via the parent POM. Nothing in this library used it.
+
+### Behaviour fixes
+
+- No factory method runs while a pool lock is held. One slow `createObject`, `activateObject`,
+  `passivateObject` or validation no longer stalls every other borrower and returner.
+- Creation runs in parallel up to `maxPoolSize`.
+- An object being validated by the evictor is removed from the idle queue first, so a borrower
+  can never receive an object that another thread is testing.
+- A failing `passivateObject` on return destroys the object and frees its slot immediately.
+  Previously the slot stayed occupied until abandon detection ran.
+- Idle-timeout eviction no longer drops the pool below `minPoolSize` only to recreate the
+  objects in the same run.
+- `waitingCount()` counts threads actually waiting for an object. It previously counted threads
+  waiting for an internal lock and missed parked waiters.
+- `retryCreationDelay` is capped at the remaining borrow wait, so the total wait never exceeds
+  `waitingForObjectTimeout`.
+- The retry counter was off by one and allowed one more creation attempt than configured.
+- The interrupt flag is restored before `PoolException` is thrown on interruption.
+- `toBuilder()` now copies `poolName`.
+- `EvictionPolicy.RANDOM` now actually samples at random. It previously took the first N.
+- Min-idle fill signals waiting borrowers.
+- An `Error` thrown by any factory method (for example `NoClassDefFoundError`) no longer leaks a
+  capacity slot or an object. Cleanup always runs; `VirtualMachineError`s are then rethrown.
+- Idle timeout, abandon detection and eviction timing use the monotonic clock, so a wall-clock
+  step cannot make objects look abandoned or expired.
+- `destroyAllIdleObjects()` also removes an object that the evictor is validating at that moment.
+- `numValidationsPerEvictionRun` now limits only factory validation. Idle-timeout and
+  `shouldEvict` checks always cover every idle object, so `0` no longer disables eviction.
+- Eviction-policy sorting snapshots borrow counts so concurrent borrows cannot break the sort.
+- A waiter that times out or is interrupted after being signalled passes the signal on.
+- Returning an object that the abandon check is reclaiming at that instant no longer throws.
+- Pools dropped without `close()` are no longer pinned by the maintenance scheduler.
+- Durations too large for a `long` of nanoseconds are treated as unbounded, and sub-millisecond
+  maintenance intervals are accepted.
+
+### New
+
+- `borrowObject(Duration maxWait)`.
+- `Lease<T>` with `pool.lease()` for try-with-resources borrowing, plus `pool.use(Consumer)` and
+  `pool.apply(Function)`.
+- `prepare()`, `addObject()`, `addObjects(int)`.
+- `forceClose()`.
+- `PoolClosedException`.
+- `PooledObjectFactory.shouldEvict(T, PooledObject<T>)` hook for per-object eviction decisions,
+  for example retiring connections on a server-initiated handoff.
+- Default no-op implementations for `activateObject`, `passivateObject`,
+  `isObjectValidForBorrow` and `isObjectValid`. A minimal factory is two methods.
+- `PoolStats stats()` snapshot record.
+- `PooledObject` exposes `state()`, `idleTime()`, `borrowedTime()`, `lastReturnedTime()`.
+- `lifo(boolean)` and `abandonCheckEnabled()` on the config.
+- A `module-info.java` (`bonfire.oss.sop`).
+
+### Internals
+
+- One shared daemon thread ticks maintenance for all pools; each run executes on a virtual
+  thread named after the pool. Pools no longer own a non-daemon thread each, and nothing is
+  scheduled for features that are disabled.
+- Parent POM moved to `bonfire-oss-parent` 2.0.0 (JUnit 6, Mockito 5.24, Logback 1.6).
+- The performance test runs only under `mvn verify -Pperf`.
+
+## 2.4.0 and earlier
+
+See the git history.
