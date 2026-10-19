@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -116,9 +117,11 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   private final AtomicLong idSequence     = new AtomicLong();
   private final AtomicLong destroyedCount = new AtomicLong();
-  private final AtomicLong borrowCount    = new AtomicLong();
+  /** Written on every borrow, read only by stats, so a striped adder beats a single CAS line. */
+  private final LongAdder  borrowCount    = new LongAdder();
 
   private volatile boolean            closed;
+  private final    AtomicBoolean      closeStarted = new AtomicBoolean();
   private final    ScheduledFuture<?> maintenanceTask;
   private final    ScheduledFuture<?> abandonTask;
 
@@ -274,7 +277,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
         p.markBorrowed();
         borrowed.put(new IdentityKey(object), p);
-        borrowCount.incrementAndGet();
+        borrowCount.increment();
         if (closed) {
           // Lost the race with close(): behave as if we had returned it to a closed pool.
           if (borrowed.remove(new IdentityKey(object)) != null) {
@@ -875,11 +878,8 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    */
   @Override
   public void close() {
-    if (closed) return;
-    synchronized (this) {
-      if (closed) return;
-      closed = true;
-    }
+    if (!closeStarted.compareAndSet(false, true)) return;
+    closed = true;
     log.info("Pool {}: closing (total={}, idle={}, borrowed={})", name, total.get(), idle.size(), borrowed.size());
     if (maintenanceTask != null) maintenanceTask.cancel(false);
     if (abandonTask != null) abandonTask.cancel(false);
@@ -943,7 +943,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /** @return successful borrows since construction */
   public long numOfTimesBorrowedFromPool() {
-    return borrowCount.get();
+    return borrowCount.sum();
   }
 
   /**
@@ -966,7 +966,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /** @return a snapshot of the pool's counters */
   public PoolStats stats() {
-    return new PoolStats(total.get(), idle.size(), borrowed.size(), waiters.get(), idSequence.get(), destroyedCount.get(), borrowCount.get(), maxPoolSize);
+    return new PoolStats(total.get(), idle.size(), borrowed.size(), waiters.get(), idSequence.get(), destroyedCount.get(), borrowCount.sum(), maxPoolSize);
   }
 
   @Override
