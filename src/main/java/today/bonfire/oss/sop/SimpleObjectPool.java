@@ -1,713 +1,1030 @@
 package today.bonfire.oss.sop;
 
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import today.bonfire.oss.sop.exceptions.PoolClosedException;
 import today.bonfire.oss.sop.exceptions.PoolException;
 import today.bonfire.oss.sop.exceptions.PoolObjectException;
 import today.bonfire.oss.sop.exceptions.PoolObjectValidationException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.*;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
- * A generic object pool that manages the lifecycle of pooled objects.
- * It supports borrowing, returning, and eviction of objects based on configurable parameters.
+ * A bounded, thread-safe object pool.
+ * <p>
+ * Design notes:
+ * <ul>
+ *   <li>Capacity is a counter reserved with a compare-and-set before an object is created, so
+ *       creations run in parallel up to {@code maxPoolSize}.</li>
+ *   <li>Idle objects live in a lock-free deque. LIFO by default, so a burst leaves cold objects
+ *       at the tail where the evictor finds them.</li>
+ *   <li>Borrowed objects are tracked by identity. The pooled type needs no interface and the pool
+ *       never calls {@code equals} or {@code hashCode} on it.</li>
+ *   <li>No factory method is ever called while a lock that borrowers or returners contend is
+ *       held. Eviction runs are serialised among themselves only. An object being validated by
+ *       the evictor is removed from the idle deque first, so no borrower can see it.</li>
+ *   <li>Borrowers that find no idle object and no free capacity park on a condition. Returns,
+ *       destroys and {@link #close()} signal it.</li>
+ *   <li>Maintenance (eviction, min-idle fill, abandon detection) is ticked by one shared daemon
+ *       thread and runs on a virtual thread per pool, so a slow factory in one pool never delays
+ *       another.</li>
+ *   <li>Every factory call is guarded against {@link Throwable}: the slot or object is cleaned up
+ *       first, then {@link VirtualMachineError}s are rethrown and everything else is treated as
+ *       a failure of that object.</li>
+ * </ul>
+ * The constructor does not create objects. Call {@link #prepare()} or {@link #addObjects(int)}
+ * to prefill, otherwise the first maintenance run fills to {@code minPoolSize}.
+ * <p>
+ * {@code fairness(true)} serves parked waiters in arrival order through a fair lock. A newcomer
+ * that arrives while others are parked goes behind them, but one that wins the race for a freed
+ * capacity slot can still create an object first. Ordering is best effort, never a guarantee.
  *
- * @param <T> The type of object to be pooled, must implement {@link PoolObject}
+ * @param <T> the type of object to be pooled
  */
-public class SimpleObjectPool<T extends PoolObject> implements AutoCloseable {
+public class SimpleObjectPool<T> implements AutoCloseable {
 
-  private static final Logger log = org.slf4j.LoggerFactory.getLogger(SimpleObjectPool.class);
+  private static final Logger log = LoggerFactory.getLogger(SimpleObjectPool.class);
 
-  private final ConcurrentLinkedQueue<PooledObject<T>> idleObjects       = new ConcurrentLinkedQueue<>();
-  private final Map<Long, PooledObject<T>>             borrowedObjects   = new ConcurrentHashMap<>();
-  private final ScheduledExecutorService               scheduler         = Executors.newSingleThreadScheduledExecutor();
-  private final PooledObjectFactory<T>                 factory;
-  private final SimpleObjectPoolConfig                 config;
-  private final ReentrantLock                          lock;
-  private final ReentrantLock                          creationLock;
-  private final Condition                              notEmpty;
-  private final Condition                              retryCreationWait;
-  private final AtomicLong                             objectCreateCount = new AtomicLong(0);
-  private final AtomicInteger                          currentPoolSize   = new AtomicInteger(0);
-  private final AtomicLong                             timesBorrowed     = new AtomicLong(0);
+  /** One daemon thread ticks every pool's maintenance. The work itself runs on virtual threads. */
+  private static final ScheduledExecutorService SCHEDULER;
+
+  static {
+    ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, r -> {
+      Thread t = new Thread(r, "sop-maintenance");
+      t.setDaemon(true);
+      return t;
+    });
+    executor.setRemoveOnCancelPolicy(true);
+    SCHEDULER = executor;
+  }
+
+  private final SimpleObjectPoolConfig config;
+  private final PooledObjectFactory<T> factory;
+  private final String                 name;
+  private final int                    maxPoolSize;
+  private final boolean                lifo;
+  private final long                   evictionTimeoutNanos;
+
+  private final ConcurrentLinkedDeque<PooledObject<T>>          idle     = new ConcurrentLinkedDeque<>();
+  private final ConcurrentHashMap<IdentityKey, PooledObject<T>> borrowed = new ConcurrentHashMap<>();
+
+  /**
+   * Objects the pool destroyed while they were still borrowed (abandon check, forceClose). Their
+   * holders may still return them; those returns are silently ignored. Entries are weak identity
+   * references so an object that is never returned does not leak.
+   */
+  private final Set<WeakIdentityKey>   reclaimed      = ConcurrentHashMap.newKeySet();
+  private final ReferenceQueue<Object> reclaimedQueue = new ReferenceQueue<>();
+
+  /** Objects alive or being created. Never exceeds maxPoolSize. */
+  private final AtomicInteger total = new AtomicInteger();
+
+  private final ReentrantLock waitLock;
+  private final Condition     available;
+  private final AtomicInteger waiters = new AtomicInteger();
+
+  private final ReentrantLock evictionLock        = new ReentrantLock();
+  private final AtomicBoolean maintenanceRunning  = new AtomicBoolean();
+  private final AtomicBoolean abandonCheckRunning = new AtomicBoolean();
+  /** Bumped by destroyAllIdleObjects so an object under idle test at that moment is destroyed instead of restored. */
+  private final AtomicLong    clearEpoch          = new AtomicLong();
+
+  private final AtomicLong idSequence     = new AtomicLong();
+  private final AtomicLong destroyedCount = new AtomicLong();
+  /** Written on every borrow, read only by stats, so a striped adder beats a single CAS line. */
+  private final LongAdder  borrowCount    = new LongAdder();
+
+  private volatile boolean            closed;
+  private final    AtomicBoolean      closeStarted = new AtomicBoolean();
+  private final    ScheduledFuture<?> maintenanceTask;
+  private final    ScheduledFuture<?> abandonTask;
 
   public SimpleObjectPool(SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
-    this.config       = config;
-    this.factory      = factory;
-    lock              = new ReentrantLock(config.fairness());
-    creationLock      = new ReentrantLock(true);
-    notEmpty          = lock.newCondition();
-    retryCreationWait = lock.newCondition();
+    this.config               = Objects.requireNonNull(config, "config");
+    this.factory              = Objects.requireNonNull(factory, "factory");
+    this.name                 = config.poolName();
+    this.maxPoolSize          = config.maxPoolSize();
+    this.lifo                 = config.lifo();
+    this.evictionTimeoutNanos = Math.max(0, saturatedNanos(config.objEvictionTimeout()));
+    this.waitLock             = new ReentrantLock(config.fairness());
+    this.available            = waitLock.newCondition();
 
-    scheduler.scheduleAtFixedRate(() -> evictionRun(false), config.durationBetweenEvictionsRuns(), config.durationBetweenEvictionsRuns(), TimeUnit.MILLISECONDS);
-    scheduler.scheduleAtFixedRate(this::abandonCheckRun, config.durationBetweenAbandonCheckRuns(), config.durationBetweenAbandonCheckRuns(), TimeUnit.MILLISECONDS);
-    log.info("Pool - {} created with maxPoolSize: {}, minPoolSize: {}", config.poolName(), config.maxPoolSize(), config.minPoolSize());
-    ensureMinIdle();
+    boolean needsMaintenance = config.evictionPolicy() != SimpleObjectPoolConfig.EvictionPolicy.NONE || config.minPoolSize() > 0;
+    maintenanceTask = needsMaintenance
+                      ? schedule(this, config.durationBetweenEvictionsRuns(), "maintenance", pool -> pool.runOnVirtualThread("maintenance", pool.maintenanceRunning, pool::scheduledMaintenance))
+                      : null;
+    abandonTask = config.abandonCheckEnabled()
+                  ? schedule(this, config.durationBetweenAbandonCheckRuns(), "abandon-check", pool -> pool.runOnVirtualThread("abandon-check", pool.abandonCheckRunning, pool::abandonCheckRun))
+                  : null;
+    log.info("Pool {} created: maxPoolSize={}, minPoolSize={}, lifo={}, abandonCheck={}", name, maxPoolSize, config.minPoolSize(), lifo, config.abandonCheckEnabled());
   }
-
 
   public SimpleObjectPool(PooledObjectFactory<T> factory) {
-    this(SimpleObjectPoolConfig.builder().build(), factory);
-
+    this(SimpleObjectPoolConfig.defaultConfig(), factory);
   }
 
   /**
-   * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
-   * This method is called periodically when pool size is greater than minPoolSize.
-   * Evicted objects are destroyed using the objectFactory.
+   * Schedules a periodic task that holds the pool only weakly, so a pool that is dropped without
+   * being closed can still be garbage collected; its task then cancels itself on the next tick.
    */
-  private void evictionRun(boolean testAll) {
-    if (config.evictionPolicy() == SimpleObjectPoolConfig.EvictionPolicy.NONE) {
-      return;
-    }
-
-    // Capture the current size of idle objects to determine the batch size for this run.
-    // This snapshot prevents processing newly returned objects in the same run if they flood in.
-    int size = idleObjects.size();
-    if (size < 1) {
-      // Even if empty, we might need to ensure min idle, BUT standard pool behavior usually
-      // does min idle check *after* potential evictions.
-      // However, if it's empty, we just skip to the min-idle check at the end.
-      ensureMinIdle();
-      return;
-    }
-
-    // Determine how many objects to test in this run
-    // If testAll is true (manual evict()), test all idle objects
-    // Otherwise, limit to configured numValidationsPerEvictionRun
-    int numToTest = testAll ? size : Math.min(config.numValidationsPerEvictionRun(), size);
-
-    List<PooledObject<T>> objectsToDestroy = new ArrayList<>();
-
-    try {
-      lock.lock();
-      List<PooledObject<T>> objectsForTest = selectEvictionCandidates(numToTest);
-
-      for (var pooledObject : objectsForTest) {
-        if (shouldEvict(pooledObject)) {
-          // Remove from the main idle queue if it's still there
-          if (idleObjects.remove(pooledObject)) {
-            currentPoolSize.decrementAndGet();
-            notEmpty.signal();
-            objectsToDestroy.add(pooledObject);
-          } else {
-            log.error("Possible memory leak: Object not found in idle queue when evicting: id={}, pool={}", pooledObject.id(), config.poolName());
-          }
-        }
+  private static <T> ScheduledFuture<?> schedule(SimpleObjectPool<T> pool, Duration period, String task, Consumer<SimpleObjectPool<T>> body) {
+    long nanos = Math.max(1, saturatedNanos(period));
+    var  ref   = new WeakReference<>(pool);
+    var  self  = new AtomicReference<ScheduledFuture<?>>();
+    ScheduledFuture<?> future = SCHEDULER.scheduleWithFixedDelay(() -> {
+      SimpleObjectPool<T> p = ref.get();
+      if (p == null || p.closed) {
+        ScheduledFuture<?> f = self.get();
+        if (f != null) f.cancel(false);
+        return;
       }
-
-    } catch (Exception e) {
-      log.error("Error during eviction run", e);
-    } finally {
-      lock.unlock();
-    }
-
-    // Destroy collected objects outside of lock (best practice to avoid holding lock during I/O or long ops)
-    for (PooledObject<T> p : objectsToDestroy) {
-      destroyPooledObject(p);
-      log.debug("Evicted and destroyed object: id={}, idleTime={}ms", p.id(), p.idlingTime());
-    }
-
-    // Ensure min pool size
-    ensureMinIdle();
-  }
-
-  private List<PooledObject<T>> selectEvictionCandidates(int numToTest) {
-    List<PooledObject<T>> objectsForTest = null;
-    switch (config.evictionPolicy()) {
-      case RANDOM -> {
-        objectsForTest = new ArrayList<>(idleObjects);
-        if (objectsForTest.size() > numToTest) {
-          // This sublist logic is a bit weak for "Random" but consistent with previous "test all".
-          // Previous code tested *all* if policy was random (copied list).
-          // Let's just take the first N for efficiency if we are limiting.
-          objectsForTest = objectsForTest.subList(0, numToTest);
-        }
-      }
-      case OLDEST_FIRST -> {
-        objectsForTest = idleObjects.stream()
-                                    .sorted(Comparator.comparingLong(PooledObject::creationTime))
-                                    .limit(numToTest)
-                                    .toList();
-      }
-      case LEAST_USED -> {
-        objectsForTest = idleObjects.stream()
-                                    .sorted(Comparator.comparingLong(PooledObject::borrowCount))
-                                    .limit(numToTest)
-                                    .toList();
-      }
-      case MOST_USED -> {
-        objectsForTest = idleObjects.stream()
-                                    .sorted((o1, o2) -> Long.compare(o2.borrowCount(), o1.borrowCount()))
-                                    .limit(numToTest)
-                                    .toList();
-      }
-    }
-
-    if (objectsForTest == null) {
-      // Fallback or SHOULD NOT HAPPEN.
-      objectsForTest = new ArrayList<>();
-    }
-    return objectsForTest;
-  }
-
-  private boolean shouldEvict(PooledObject<T> pooledObject) {
-    // 1. Idle Eviction Check
-    // If object is idle for too long, mark for eviction.
-    if (pooledObject.idlingTime() > config.objEvictionTimeout()) {
-      return true;
-    } else if (config.testWhileIdle()) {
-      // 2. Validation (Test While Idle)
-      // Only test if not already evicted.
-      // Standard lifecycle: activate -> validate -> passivate
-      boolean active = false;
       try {
-        factory.activateObject(pooledObject.object());
-        active = true;
-        if (!factory.isObjectValid(pooledObject.object())) {
-          return true;
-        }
-      } catch (Exception e) {
-        log.warn("Object failed validation/activation during eviction check: id={}, pool={}", pooledObject.id(), config.poolName(), e);
-        return true;
-      } finally {
-        if (active) {
-          try {
-            factory.passivateObject(pooledObject.object());
-          } catch (Exception e) {
-            log.warn("Object failed passivation during eviction check: id={}, pool={}", pooledObject.id(), config.poolName(), e);
-            return true;
-          }
-        }
+        body.accept(p);
+      } catch (Throwable t) {
+        log.error("Pool {}: failed to start {} run", p.name, task, t);
       }
-    }
-    return false;
+    }, nanos, nanos, TimeUnit.NANOSECONDS);
+    self.set(future);
+    return future;
   }
 
-  /**
-   * Internal method to evict idle objects that exceed the minPoolSize and have been idle longer than idleEvictionTimeout.
-   * This method is called periodically when pool size is greater than minPoolSize.
-   * Evicted objects are destroyed using the objectFactory.
-   */
-
-  private void ensureMinIdle() {
-    if (config.minPoolSize() > 0 && idleObjects.size() < config.minPoolSize() && currentPoolSize.get() < config.maxPoolSize()) {
-      int diff = config.minPoolSize() - idleObjects.size();
-      // We should verify we don't exceed maxPoolSize while filling
-      // It's possible currentPoolSize > idleObjects.size() (borrowed objects exist)
-      // We can only add if currentPoolSize < maxPoolSize.
-      // Safe looping:
-      for (int i = 0; i < diff; i++) {
-        if (currentPoolSize.get() >= config.maxPoolSize()) {
-          break;
-        }
-        creationLock.lock();
-        try {
-          if (currentPoolSize.get() >= config.maxPoolSize()) {
-            break;
-          }
-          // We are in a scheduled thread, not blocking a user request, so standard create is fine?
-          // createObject increments currentPoolSize and adds to valid creation counts inside the method or caller?
-          createAndAddIdleObject();
-        } catch (Exception e) {
-          log.warn("Failed to create object to maintain minPoolSize", e);
-          // If creation fails, waiting a bit or aborting this run is safer than tight loop spinning.
-          break;
-        } finally {
-          creationLock.unlock();
-        }
-      }
-    }
-  }
+  // ---------------------------------------------------------------------------------------------
+  // Borrow
+  // ---------------------------------------------------------------------------------------------
 
   /**
-   * Internal method to detect and remove objects that have been borrowed but not returned within abandonedObjectTimeout.
-   * This helps prevent resource leaks when clients fail to return objects.
-   * Abandoned objects are destroyed using the objectFactory.
-   */
-  private void abandonCheckRun() {
-    List<PooledObject<T>> objectsToRemove = new ArrayList<>();
-    var                   now             = System.currentTimeMillis();
-    try {
-      lock.lock();
-      borrowedObjects.forEach((id, pooledObject) -> {
-        if ((pooledObject.isAbandoned(now, config.abandonedTimeout()))) {
-          objectsToRemove.add(pooledObject);
-        }
-      });
-
-      for (PooledObject<T> pooledObject : objectsToRemove) {
-        log.warn("Removing abandoned object with id {} in pool - {}. It has been borrowed for more than {} ms and destroying it.", pooledObject.id(), config.poolName(),
-                 now - pooledObject.lastBorrowedTime());
-        removeAndDestroyBorrowedObjects(pooledObject);
-      }
-    } catch (Exception e) {
-      log.warn("Error removing abandoned objects in pool - {}", config.poolName(), e);
-    } finally {
-      lock.unlock();
-    }
-  }
-
-  /**
-   * Destroys a pooled object using the object factory.
+   * Borrows an object, waiting up to {@link SimpleObjectPoolConfig#waitingForObjectTimeout()}.
    *
-   * @param pooledObject The pooled entity to destroy
-   */
-  private void removeAndDestroyBorrowedObjects(PooledObject<T> pooledObject) {
-    if (borrowedObjects.remove(pooledObject.id()) != null) {
-      currentPoolSize.decrementAndGet();
-      notEmpty.signal();
-    }
-    destroyPooledObject(pooledObject);
-  }
-
-
-  private void createAndAddIdleObject() {
-    PooledObject<T> p = createObject();
-    idleObjects.add(p);
-    currentPoolSize.incrementAndGet();
-  }
-
-  private void destroyPooledObject(PooledObject<T> pooledObject) {
-    if (pooledObject != null) {
-      destroyPoolObject(pooledObject.object());
-    }
-  }
-
-  private void destroyPoolObject(T object) {
-    try {
-      factory.destroyObject(object);
-    } catch (Exception e) {
-      log.warn("Failed to destroy object with id {} in pool - {}", object.getEntityId(), config.poolName(), e);
-    }
-  }
-
-  private boolean isValidForBorrow(PooledObject<T> pooledObject) {
-    final var object = pooledObject.object();
-    if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
-      // Object is invalid before it has been added to borrowedObjects or
-      // returned to the idle queue. We must destroy it and adjust the
-      // pool size, regardless of whether it was newly created or taken
-      // from idle.
-      currentPoolSize.decrementAndGet();
-      destroyPoolObject(object);
-      return false;
-    }
-    return true;
-  }
-
-  private PooledObject<T> createObject() {
-    PooledObject<T> pooledObject;
-    try {
-      pooledObject = new PooledObject<>(factory.createObject(), objectCreateCount.incrementAndGet());
-    } catch (Exception e) {
-      log.error("Failed to create object for the pool: {}", e.getMessage());
-      throw e;
-    }
-    if (config.testOnCreate()) {
-      if (!factory.isObjectValid(pooledObject.object())) {
-        throw new PoolObjectValidationException("Object validation failed on create");
-      }
-    }
-    return pooledObject;
-  }
-
-  /**
-   * Returns the configuration used by this object pool.
+   * @return a pooled object, never null
    *
-   * @return the configuration used by this object pool
-   */
-  public SimpleObjectPoolConfig config() {
-    return config;
-  }
-
-  /**
-   * Performs eviction of idle objects from the pool.
-   * <p>
-   * This method can be called manually to trigger an eviction run outside of the
-   * scheduled eviction cycle. It examines idle objects and evicts those that:
-   * <ul>
-   *   <li>Have been idle longer than {@link SimpleObjectPoolConfig#objEvictionTimeout()}</li>
-   *   <li>Fail validation if {@link SimpleObjectPoolConfig#testWhileIdle()} is enabled</li>
-   * </ul>
-   * </p>
-   * <p>
-   * The number of objects examined is determined by
-   * {@link SimpleObjectPoolConfig#numValidationsPerEvictionRun()}.
-   * </p>
-   * <p>
-   * After eviction, the pool will attempt to maintain the minimum idle pool size
-   * by creating new objects if necessary.
-   * </p>
-   *
-   * @throws Exception if an error occurs during eviction
-   */
-  public void evict() throws Exception {
-    evictionRun(true); // Test all idle objects when manually invoked
-  }
-
-  /**
-   * Destroys all idle objects in the pool.
-   * This method removes and destroys all objects from the idle queue,
-   * regardless of the minimum pool size or idle time.
-   */
-  public void destroyAllIdleObjects() {
-    try {
-      lock.lock();
-      // Collect all idle objects for destruction
-      var objectsToDestroy = new ArrayList<>(idleObjects);
-      idleObjects.clear();
-      currentPoolSize.addAndGet(Math.negateExact(objectsToDestroy.size()));
-
-      // Destroy collected objects
-      for (PooledObject<T> pooledObject : objectsToDestroy) {
-        log.debug("Destroying idle object with id {}.", pooledObject.id());
-        destroyPooledObject(pooledObject);
-      }
-      log.info("Destroyed {} idle objects. Current pool size: {}",
-               objectsToDestroy.size(), currentPoolSize());
-    } catch (Exception e) {
-      log.error("Error destroying all idle objects", e);
-    } finally {
-      lock.unlock();
-    }
-  }
-
-  /**
-   * Borrows an object from the pool with a specified timeout.
-   * If an idle object is available, it is returned immediately.
-   * If no idle object is available and pool size is less than config.maxPoolSize(), creates a new object.
-   * Otherwise, waits for the specified timeout for an object to become available.
-   *
-   * @return A pooled object of type T
-   *
-   * @throws PoolException if object validation fails, unable to borrow within timeout, or thread interrupted
+   * @throws PoolTimeoutException if no object became available in time; if creation failed during
+   *                              the wait, the last creation exception is the cause
+   * @throws PoolClosedException  if the pool is closed, or is closed while waiting
+   * @throws PoolException        if the thread is interrupted; the interrupt flag is restored
+   * @throws RuntimeException     whatever the factory threw from {@code createObject()} once retries are exhausted
    */
   public T borrowObject() throws PoolException {
-    PooledObject<T> pooledObject   = null;
-    boolean         acquired       = false;
-    final long      startTime      = System.nanoTime();
-    final var       waitTimeout    = config.waitingForObjectTimeout();
-    long            remainingNanos = waitTimeout;
-    int             retriesLeft    = config.maxRetries();
+    return borrowObject(config.waitingForObjectTimeout());
+  }
+
+  /**
+   * Borrows an object with an explicit wait. A negative duration waits indefinitely and
+   * {@link Duration#ZERO} fails immediately when the pool is exhausted.
+   *
+   * @param maxWait how long to wait for capacity or an idle object
+   * @return a pooled object, never null
+   * @see #borrowObject()
+   */
+  public T borrowObject(Duration maxWait) throws PoolException {
+    Objects.requireNonNull(maxWait, "maxWait");
+    final long    waitNanos = saturatedNanos(maxWait);
+    final boolean infinite  = waitNanos < 0 || waitNanos == Long.MAX_VALUE;
+    final long    deadline  = infinite ? 0 : System.nanoTime() + waitNanos;
+
+    int              createAttemptsLeft = config.maxRetries() + 1;
+    RuntimeException lastCreateFailure  = null;
+    boolean          retryPending       = false;
 
     try {
-      acquired = lock.tryLock(remainingNanos, TimeUnit.NANOSECONDS);
-      if (!acquired) {
-        throw new PoolTimeoutException("Timeout waiting to acquire lock to borrow object");
-      }
-      remainingNanos = waitTimeout - (System.nanoTime() - startTime);
-      do {
-        // First try to get from idle objects
-        boolean newlyCreated = false;
-        pooledObject = idleObjects.poll();
-        if (pooledObject == null) {
-          // Try to create new, if pool is not full
-          if (borrowedObjects.size() < config.maxPoolSize()) {
-            if (retriesLeft < 0) {
-              throw new PoolObjectException("Max retries reached while creating object and failing to borrow");
-            }
-            // Apply creation retry delay if configured only from second try
-            if (retriesLeft < config.maxRetries()) {
-              if (config.retryCreationDelay() > 0) {
-                remainingNanos -= retryCreationWait.awaitNanos(config.retryCreationDelay());
-              } else {
-                // calculate remaining time
-                remainingNanos = waitTimeout - (System.nanoTime() - startTime);
-              }
-              // happens from first retry only
-              if (remainingNanos <= 0) {
-                throw new PoolTimeoutException("Timeout waiting for object creation during borrow");
-              }
-            }
+      while (true) {
+        if (closed) {
+          throw new PoolClosedException("Pool " + name + " is closed");
+        }
 
+        PooledObject<T> p     = null;
+        boolean         fresh = false;
+
+        // Fast path: skip the lock entirely when nobody is queued. With fairness on and
+        // waiters present, newcomers go through the (fair) lock behind them.
+        if (!config.fairness() || waiters.get() == 0) {
+          p = idle.pollFirst();
+        }
+
+        if (p == null) {
+          if (retryPending) {
+            // Directly after a failed creation: honour the retry delay, capped at the remaining
+            // wait, without holding a slot while we sleep.
+            retryPending = false;
+            long delay = saturatedNanos(config.retryCreationDelay());
+            if (delay > 0) {
+              long remaining = infinite ? delay : deadline - System.nanoTime();
+              if (remaining <= 0) {
+                throw new PoolTimeoutException("Timed out in pool " + name + " before retrying object creation", lastCreateFailure);
+              }
+              TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining));
+            }
+          }
+          if (reserveSlot()) {
+            boolean created = false;
             try {
-              creationLock.lock();
-              try {
-                if (currentPoolSize.get() < config.maxPoolSize()) {
-                  pooledObject = createObject();
-                  newlyCreated = true;
-                  currentPoolSize.incrementAndGet();
-                  retriesLeft--;
-                }
-              } finally {
-                creationLock.unlock();
-              }
-            } catch (Exception e) {
-              if (e instanceof PoolObjectValidationException) {
-                log.error("", e);
-              }
-              retriesLeft--;
-              if (retriesLeft < 0) {
-                // we have exhausted retries and throw the actual exception so that the caller can handle it
+              p       = create();
+              created = true;
+              fresh   = true;
+            } catch (RuntimeException e) {
+              lastCreateFailure = e;
+              createAttemptsLeft--;
+              if (createAttemptsLeft <= 0) {
                 throw e;
               }
+              retryPending = true;
+              log.warn("Pool {}: object creation failed, {} attempt(s) left: {}", name, createAttemptsLeft, e.toString());
+            } finally {
+              if (!created) {
+                releaseSlot(); // also covers Errors escaping the factory
+              }
+            }
+            if (p == null) {
               continue;
             }
-          }
-
-          // If still null, wait for objects to become available
-          if (pooledObject == null) {
-            remainingNanos = notEmpty.awaitNanos(remainingNanos);
-            if (remainingNanos <= 0) {
-              throw new PoolTimeoutException("Timeout waiting for available object");
+          } else {
+            p = awaitAvailable(infinite, deadline, lastCreateFailure);
+            if (p == null) {
+              continue; // capacity may have freed up, go round and try to reserve it
             }
-            continue;
           }
         }
 
-        if (!isValidForBorrow(pooledObject)) {
+        T object = p.object();
+        if (!fresh && !prepareForBorrow(p)) {
           continue;
         }
 
-
-        // Object is valid, prepare for borrowing
-        final var object = pooledObject.object();
-        try {
-          pooledObject.borrow();
-          if (!newlyCreated) {
-             factory.activateObject(object);
+        p.markBorrowed();
+        borrowed.put(new IdentityKey(object), p);
+        borrowCount.increment();
+        if (closed) {
+          // Lost the race with close(): behave as if we had returned it to a closed pool.
+          if (borrowed.remove(new IdentityKey(object)) != null) {
+            destroy(p, "pool closed during borrow");
           }
-          borrowedObjects.put(pooledObject.id(), pooledObject);
-          timesBorrowed.incrementAndGet();
-          notEmpty.signal();
-          log.trace("Resource borrowed - id: {}, current pool size: {}",
-                    pooledObject.id(), currentPoolSize.get());
-          return object;
-        } catch (Exception e) {
-          log.warn("Failed to activate object with id {} in pool - {}", pooledObject.id(), config.poolName(), e);
-          currentPoolSize.decrementAndGet();
-          destroyPoolObject(object);
-          // Continue the loop to try getting another object
-          continue;
+          throw new PoolClosedException("Pool " + name + " is closed");
         }
-      } while (remainingNanos > 0);
-
-      throw new PoolTimeoutException("Timeout waiting for an available object to borrow");
-    } catch (InterruptedException e) {
-      throw new PoolException("Thread interrupted while attempting to borrow object", e);
-    } finally {
-      if (acquired) {
-        lock.unlock();
+        if (log.isTraceEnabled()) {
+          log.trace("Pool {}: borrowed object {} (total={}, idle={})", name, p.id(), total.get(), idle.size());
+        }
+        return object;
       }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new PoolException("Interrupted while borrowing from pool " + name, e);
     }
   }
 
   /**
-   * Returns a borrowed object back to the pool.
-   * If the object is marked as broken or invalid, it will be destroyed instead of being returned to the pool.
+   * Validates (if configured) and activates an idle object the caller now owns. On any failure
+   * the object is destroyed and false is returned; fatal errors are rethrown after cleanup.
+   */
+  private boolean prepareForBorrow(PooledObject<T> p) {
+    T object = p.object();
+    try {
+      if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
+        destroy(p, "failed validation on borrow");
+        return false;
+      }
+      factory.activateObject(object);
+      return true;
+    } catch (Throwable t) {
+      destroy(p, "validation or activation on borrow threw");
+      rethrowIfFatal(t);
+      log.warn("Pool {}: validation or activation of object {} threw, destroyed it", name, p.id(), t);
+      return false;
+    }
+  }
+
+  /**
+   * Parks until an idle object is pushed, capacity is released or the pool is closed.
    *
-   * @param obj    The object to return to the pool
-   * @param broken Flag indicating if the object is in a broken state
+   * @return an idle object, or null if capacity may now be available and the caller should retry
+   */
+  private PooledObject<T> awaitAvailable(boolean infinite, long deadline, RuntimeException lastCreateFailure) throws InterruptedException {
+    waitLock.lockInterruptibly();
+    waiters.incrementAndGet();
+    boolean consumed = false;
+    try {
+      while (true) {
+        if (closed) {
+          throw new PoolClosedException("Pool " + name + " closed while waiting for an object");
+        }
+        PooledObject<T> p = idle.pollFirst();
+        if (p != null) {
+          consumed = true;
+          return p;
+        }
+        if (total.get() < maxPoolSize) {
+          consumed = true;
+          return null;
+        }
+        if (infinite) {
+          available.await();
+        } else {
+          long remaining = deadline - System.nanoTime();
+          if (remaining <= 0) {
+            throw new PoolTimeoutException("Timed out waiting for an object from pool " + name + " (idle=0, total=" + total.get() + "/" + maxPoolSize + ")", lastCreateFailure);
+          }
+          available.awaitNanos(remaining);
+        }
+      }
+    } finally {
+      waiters.decrementAndGet();
+      if (!consumed) {
+        // Leaving on timeout, interrupt or close without taking anything: a signal meant for us
+        // must not be lost, so pass it to the next waiter.
+        available.signal();
+      }
+      waitLock.unlock();
+    }
+  }
+
+  private void signalOne() {
+    if (waiters.get() == 0) return;
+    waitLock.lock();
+    try {
+      available.signal();
+    } finally {
+      waitLock.unlock();
+    }
+  }
+
+  private void signalAll() {
+    waitLock.lock();
+    try {
+      available.signalAll();
+    } finally {
+      waitLock.unlock();
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Return
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Returns a borrowed object. Broken or invalid objects are destroyed instead of being reused.
+   * Returning to a closed pool destroys the object. Returning an object the pool already
+   * reclaimed itself (abandon detection or {@link #forceClose()}) is silently ignored.
    *
-   * @throws PoolObjectException if object validation fails
+   * @param obj    the object to return
+   * @param broken true if the caller knows the object is unusable
+   *
+   * @throws PoolObjectException if the object was not borrowed from this pool
    */
   public void returnObject(T obj, boolean broken) throws PoolObjectException {
     if (obj == null) {
-      log.error("Attempted returning null object. This is an error.");
-      throw new PoolException("Cannot return null object to pool");
+      throw new PoolObjectException("Cannot return null to pool " + name);
     }
-
-    try {
-      lock.lock();
-      var pooledObject = borrowedObjects.get(obj.getEntityId());
-      if (pooledObject == null) {
-        log.warn("Attempted returning object that is not in borrowed objects list. id: {}, pool - {}", obj.getEntityId(), config.poolName());
+    PooledObject<T> p = borrowed.remove(new IdentityKey(obj));
+    if (p == null) {
+      if (reclaimed.remove(new WeakIdentityKey(obj, null))) {
+        log.debug("Pool {}: ignoring return of an object the pool had already reclaimed and destroyed", name);
         return;
       }
-      if (broken) {
-        pooledObject.broken(true);
-      }
-      // First check if object is broken
-      boolean isValid = !pooledObject.isBroken();
-
-      // Then perform testOnReturn validation if configured and object isn't already invalid
-      if (isValid && config.testOnReturn()) {
-        try {
-          isValid = factory.isObjectValid(obj);
-        } catch (Exception e) {
-          log.error("Error validating object on return", e);
-          // exception is swallowed since object is already invalid and will be destroyed.
-          isValid = false;
-        }
-      }
-
-      if (!isValid) {
-        log.warn("Returned broken or invalid entity with id {} to pool - {} and destroying it.", pooledObject.id(), config.poolName());
-        removeAndDestroyBorrowedObjects(pooledObject);
-      } else {
-
-        factory.passivateObject(obj);
-        borrowedObjects.remove(pooledObject.id());
-        pooledObject.markIdle();
-        idleObjects.add(pooledObject);
-        log.trace("Object returned - id: {}, current pool size: {}",
-                  pooledObject.id(), currentPoolSize.get());
-        notEmpty.signal();
-      }
-    } catch (Exception e) {
-      throw new PoolObjectException("Unable to properly return object back to pool", e);
-    } finally {
-      lock.unlock();
+      throw new PoolObjectException("Object is not currently borrowed from pool " + name);
+    }
+    if (broken) {
+      p.markBroken();
     }
 
+    if (closed) {
+      destroy(p, "returned to a closed pool");
+      return;
+    }
+    if (p.isBroken()) {
+      destroy(p, "returned as broken");
+      return;
+    }
+    try {
+      if (config.testOnReturn() && !factory.isObjectValid(obj)) {
+        destroy(p, "failed validation on return");
+        return;
+      }
+      factory.passivateObject(obj);
+    } catch (Throwable t) {
+      destroy(p, "validation or passivation on return threw");
+      rethrowIfFatal(t);
+      log.warn("Pool {}: validation or passivation of object {} threw, destroyed it", name, p.id(), t);
+      return;
+    }
+
+    p.markIdle();
+    pushIdle(p);
+    if (closed) {
+      // close() may have drained the deque before our push; make sure nothing is left behind.
+      if (idle.remove(p)) {
+        destroy(p, "returned to a closed pool");
+      }
+      return;
+    }
+    if (log.isTraceEnabled()) {
+      log.trace("Pool {}: returned object {} (total={}, idle={})", name, p.id(), total.get(), idle.size());
+    }
+    signalOne();
   }
 
   /**
-   * Returns a borrowed object back to the pool.
+   * Returns a borrowed object that is still usable.
    *
-   * @param obj The object to return to the pool
-   *
-   * @throws PoolObjectException if object validation fails
+   * @see #returnObject(Object, boolean)
    */
   public void returnObject(T obj) throws PoolObjectException {
     returnObject(obj, false);
   }
 
-  /**
-   * Closes the object pool and releases all resources.
-   * This method shuts down the scheduler and destroys all pooled objects.
-   * object returned after the pool is closed will think they are not part of
-   * the pool and will get destroyed anyway.
-   */
-  @Override
-  public void close() {
-    if (!scheduler.isShutdown()) {
-      log.info("Closing object pool - {}. Current pool size: {}", config.poolName(), currentPoolSize.get());
-      scheduler.shutdown();
+  private void pushIdle(PooledObject<T> p) {
+    if (lifo) {
+      idle.addFirst(p);
     } else {
-      log.warn("Trying to close an Object pool - {} that is already closed", config.poolName());
-      return;
-    }
-
-    try {
-      if (!scheduler.awaitTermination(config.waitingForObjectTimeout(), TimeUnit.NANOSECONDS)) {
-        log.warn("Scheduler did not terminate gracefully. Shutting down forcefully.");
-        scheduler.shutdownNow();
-      }
-    } catch (InterruptedException e) {
-      log.warn("Interrupted while waiting for scheduler to terminate.", e);
-      Thread.currentThread().interrupt();
-    }
-    try {
-      lock.lock();
-      // Destroy all objects in the borrowed and idle lists
-      borrowedObjects.values().forEach(this::removeAndDestroyBorrowedObjects);
-      idleObjects.forEach(this::removeAndDestroyBorrowedObjects);
-      currentPoolSize.addAndGet(Math.negateExact(idleObjects.size()));
-      // Clear collections
-      borrowedObjects.clear();
-      idleObjects.clear();
-      log.info("Closed object pool - {}", config.poolName());
-    } finally {
-      lock.unlock();
+      idle.addLast(p);
     }
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Lease helpers
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Borrows an object wrapped in an {@link AutoCloseable} lease for use in try-with-resources.
+   */
+  public Lease<T> lease() throws PoolException {
+    return new Lease<>(this, borrowObject());
+  }
+
+  /**
+   * Borrows an object, runs the action, and returns the object. If the action throws, the object
+   * is returned as broken and the exception propagates.
+   */
+  public void use(Consumer<? super T> action) throws PoolException {
+    apply(obj -> {
+      action.accept(obj);
+      return null;
+    });
+  }
+
+  /**
+   * Borrows an object, applies the function, returns the object, and yields the result. If the
+   * function throws, the object is returned as broken and the function's exception propagates;
+   * any exception from the return is attached to it as suppressed.
+   */
+  public <R> R apply(Function<? super T, ? extends R> function) throws PoolException {
+    T obj = borrowObject();
+    R result;
+    try {
+      result = function.apply(obj);
+    } catch (Throwable t) {
+      try {
+        returnObject(obj, true);
+      } catch (RuntimeException returnFailure) {
+        t.addSuppressed(returnFailure);
+      }
+      throw t;
+    }
+    returnObject(obj, false);
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Creation and destruction
+  // ---------------------------------------------------------------------------------------------
+
+  private boolean reserveSlot() {
+    while (true) {
+      int current = total.get();
+      if (current >= maxPoolSize) {
+        return false;
+      }
+      if (total.compareAndSet(current, current + 1)) {
+        return true;
+      }
+    }
+  }
+
+  private void releaseSlot() {
+    total.decrementAndGet();
+    signalOne();
+  }
+
+  /**
+   * Creates an object for a slot the caller has already reserved. Throws the factory's exception
+   * unchanged. The caller must release the slot if this throws.
+   */
+  private PooledObject<T> create() {
+    T object = factory.createObject();
+    if (object == null) {
+      throw new PoolObjectException("Factory for pool " + name + " returned null from createObject()");
+    }
+    PooledObject<T> p = new PooledObject<>(object, idSequence.incrementAndGet());
+    if (config.testOnCreate()) {
+      boolean valid;
+      try {
+        valid = factory.isObjectValid(object);
+      } catch (Throwable t) {
+        destroyQuietly(p);
+        rethrowIfFatal(t);
+        throw new PoolObjectValidationException("Validation of a newly created object threw in pool " + name, t);
+      }
+      if (!valid) {
+        destroyQuietly(p);
+        throw new PoolObjectValidationException("Newly created object failed validation in pool " + name);
+      }
+    }
+    if (log.isTraceEnabled()) {
+      log.trace("Pool {}: created object {} (total={})", name, p.id(), total.get());
+    }
+    return p;
+  }
+
+  /** Destroys an object that owns a slot and releases that slot, whatever the factory does. */
+  private void destroy(PooledObject<T> p, String reason) {
+    log.debug("Pool {}: destroying object {}: {}", name, p.id(), reason);
+    try {
+      destroyQuietly(p);
+    } finally {
+      releaseSlot();
+    }
+  }
+
+  private void destroyQuietly(PooledObject<T> p) {
+    p.markInvalid();
+    destroyedCount.incrementAndGet();
+    try {
+      factory.destroyObject(p.object());
+    } catch (Throwable t) {
+      rethrowIfFatal(t);
+      log.warn("Pool {}: factory failed to destroy object {}", name, p.id(), t);
+    }
+  }
+
+  /** Rethrows errors the pool must never swallow. Everything else is treated as a factory failure. */
+  private static void rethrowIfFatal(Throwable t) {
+    if (t instanceof VirtualMachineError e) {
+      throw e;
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Prefill
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Creates idle objects until the pool holds {@code minPoolSize} idle objects or is full.
+   *
+   * @return the number of objects created
+   */
+  public int prepare() {
+    return ensureMinIdle();
+  }
+
+  /**
+   * Creates up to {@code count} idle objects, stopping early when the pool is full or creation
+   * fails. The first creation failure is rethrown unchanged.
+   *
+   * @return the number of objects created
+   */
+  public int addObjects(int count) {
+    int created = 0;
+    for (int i = 0; i < count; i++) {
+      if (!addObject()) break;
+      created++;
+    }
+    return created;
+  }
+
+  /**
+   * Creates one idle object.
+   *
+   * @return true if an object was created, false if the pool is full or closed
+   */
+  public boolean addObject() {
+    if (closed || !reserveSlot()) {
+      return false;
+    }
+    PooledObject<T> p       = null;
+    boolean         created = false;
+    try {
+      p       = create();
+      created = true;
+    } finally {
+      if (!created) {
+        releaseSlot();
+      }
+    }
+    pushIdle(p);
+    if (closed) {
+      if (idle.remove(p)) destroy(p, "pool closed during add");
+      return false;
+    }
+    signalOne();
+    return true;
+  }
+
+  private int ensureMinIdle() {
+    int created = 0;
+    while (!closed && idle.size() < config.minPoolSize() && total.get() < maxPoolSize) {
+      try {
+        if (!addObject()) break;
+        created++;
+      } catch (RuntimeException e) {
+        log.warn("Pool {}: could not create object to maintain minPoolSize", name, e);
+        break;
+      }
+    }
+    return created;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Maintenance: eviction, min idle, abandon detection
+  // ---------------------------------------------------------------------------------------------
+
+  private void runOnVirtualThread(String task, AtomicBoolean busy, Runnable body) {
+    if (closed) return;
+    if (!busy.compareAndSet(false, true)) {
+      log.debug("Pool {}: previous {} run still in progress, skipping this tick", name, task);
+      return;
+    }
+    boolean started = false;
+    try {
+      Thread.ofVirtual().name(name + "-" + task).start(() -> {
+        try {
+          body.run();
+        } catch (Throwable t) {
+          log.error("Pool {}: {} run failed", name, task, t);
+        } finally {
+          busy.set(false);
+        }
+      });
+      started = true;
+    } finally {
+      if (!started) {
+        busy.set(false);
+      }
+    }
+  }
+
+  private void scheduledMaintenance() {
+    // Refill first so a slow eviction pass (factory validation) never delays minimum capacity.
+    ensureMinIdle();
+    if (config.evictionPolicy() != SimpleObjectPoolConfig.EvictionPolicy.NONE) {
+      evictionRun(false);
+      ensureMinIdle();
+    }
+  }
+
+  /**
+   * Examines every idle object now, on the calling thread, regardless of the configured
+   * eviction policy. Objects that fail the factory's {@code shouldEvict} hook or validation
+   * are destroyed, as are objects idle longer than {@code objEvictionTimeout} while more than
+   * {@code minPoolSize} objects are idle. Afterwards the pool is refilled to {@code minPoolSize}.
+   * Safe to call concurrently with borrows and returns.
+   */
+  public void evict() {
+    if (closed) return;
+    evictionRun(true);
+    ensureMinIdle();
+  }
+
+  /**
+   * One eviction pass. Every idle object gets the cheap checks (shouldEvict hook, idle timeout).
+   * Factory validation is limited to {@code numValidationsPerEvictionRun} objects on a scheduled
+   * run, chosen by the eviction policy, and unlimited on a manual {@link #evict()}.
+   */
+  private void evictionRun(boolean testAll) {
+    evictionLock.lock();
+    try {
+      List<PooledObject<T>> candidates       = orderByPolicy(new ArrayList<>(idle));
+      int                   validationBudget = testAll ? Integer.MAX_VALUE : config.numValidationsPerEvictionRun();
+      // Idle-timeout eviction must not take the idle count below minPoolSize. Borrowed objects do
+      // not count. Returns during the run only make this estimate conservative.
+      int idleRemaining = candidates.size();
+
+      for (PooledObject<T> p : candidates) {
+        if (closed) return;
+        // Take exclusive ownership: once removed, no borrower can reach it.
+        if (!idle.remove(p)) {
+          idleRemaining--;
+          continue;
+        }
+        long   epoch  = clearEpoch.get();
+        String reason = null;
+        try {
+          p.markTesting();
+          boolean validate = validationBudget > 0;
+          reason = evictionReason(p, idleRemaining > config.minPoolSize(), validate);
+          if (validate) validationBudget--;
+        } catch (Throwable t) {
+          destroy(p, "eviction check threw");
+          idleRemaining--;
+          rethrowIfFatal(t);
+          log.error("Pool {}: eviction check of object {} threw, destroyed it", name, p.id(), t);
+          continue;
+        }
+        if (reason == null && clearEpoch.get() != epoch) {
+          reason = "idle queue cleared during idle test";
+        }
+        if (reason != null) {
+          idleRemaining--;
+          destroy(p, reason);
+        } else {
+          p.markIdleAfterTest(); // state only; the idle timestamp is preserved
+          // Put it back at the cold end so it keeps its place in the reuse order.
+          if (lifo) {
+            idle.addLast(p);
+          } else {
+            idle.addFirst(p);
+          }
+          if ((closed || clearEpoch.get() != epoch) && idle.remove(p)) {
+            destroy(p, closed ? "pool closed during eviction run" : "idle queue cleared during idle test");
+          } else {
+            signalOne(); // a borrower may have parked while we held the only idle object
+          }
+        }
+      }
+    } finally {
+      evictionLock.unlock();
+    }
+  }
+
+  /**
+   * @return why the object should be evicted, or null to keep it. May throw whatever the factory
+   * throws; the caller destroys the object in that case.
+   */
+  private String evictionReason(PooledObject<T> p, boolean aboveMinIdle, boolean validate) {
+    T object = p.object();
+    if (factory.shouldEvict(object, p)) {
+      return "factory requested eviction";
+    }
+    if (aboveMinIdle && p.idleNanos() >= evictionTimeoutNanos) {
+      return "idle for " + p.idleTime() + " ms";
+    }
+    if (!validate || !config.testWhileIdle()) {
+      return null;
+    }
+    factory.activateObject(object);
+    boolean valid = factory.isObjectValid(object);
+    factory.passivateObject(object);
+    return valid ? null : "failed idle validation";
+  }
+
+  /** Orders candidates so that the ones the policy prefers to validate come first. Counters are snapshotted so concurrent borrows cannot break the sort. */
+  private List<PooledObject<T>> orderByPolicy(List<PooledObject<T>> snapshot) {
+    switch (config.evictionPolicy()) {
+      case OLDEST_FIRST -> snapshot.sort(Comparator.comparingLong(PooledObject::creationTime));
+      case LEAST_USED, MOST_USED -> {
+        record Ranked<T>(PooledObject<T> p, long borrows) {}
+        List<Ranked<T>> ranked = new ArrayList<>(snapshot.size());
+        for (PooledObject<T> p : snapshot) ranked.add(new Ranked<>(p, p.borrowCount()));
+        Comparator<Ranked<T>> byBorrows = Comparator.comparingLong(Ranked::borrows);
+        ranked.sort(config.evictionPolicy() == SimpleObjectPoolConfig.EvictionPolicy.LEAST_USED ? byBorrows : byBorrows.reversed());
+        snapshot.clear();
+        for (Ranked<T> r : ranked) snapshot.add(r.p());
+      }
+      case RANDOM -> Collections.shuffle(snapshot, ThreadLocalRandom.current());
+      case NONE -> {
+        // Only reached via a manual evict(); order is irrelevant because everything is validated.
+      }
+    }
+    return snapshot;
+  }
+
+  private void markReclaimed(T object) {
+    Reference<?> dead;
+    while ((dead = reclaimedQueue.poll()) != null) {
+      reclaimed.remove(dead);
+    }
+    reclaimed.add(new WeakIdentityKey(object, reclaimedQueue));
+  }
+
+  /**
+   * Takes a borrowed object away from its holder. The reclaimed marker is placed before the
+   * ownership CAS so a concurrent return by the holder never sees a gap in which the object is
+   * neither borrowed nor reclaimed.
+   *
+   * @return true if this call took ownership and destroyed the object
+   */
+  private boolean reclaimBorrowed(IdentityKey key, PooledObject<T> p, String reason) {
+    markReclaimed(p.object());
+    if (!borrowed.remove(key, p)) {
+      reclaimed.remove(new WeakIdentityKey(p.object(), null));
+      return false;
+    }
+    destroy(p, reason);
+    return true;
+  }
+
+  private void abandonCheckRun() {
+    long timeoutNanos = Math.max(0, saturatedNanos(config.abandonedTimeout()));
+    for (var entry : borrowed.entrySet()) {
+      PooledObject<T> p = entry.getValue();
+      if (p.state() != PooledObject.State.BORROWED) continue;
+      long heldNanos = p.borrowedNanos();
+      if (heldNanos >= timeoutNanos && reclaimBorrowed(entry.getKey(), p, "abandoned")) {
+        log.warn("Pool {}: object {} had been borrowed for {} ms, treated it as abandoned and destroyed it", name, p.id(), heldNanos / 1_000_000L);
+      }
+    }
+  }
+
+  /**
+   * Destroys every idle object now, regardless of {@code minPoolSize} or idle time, including an
+   * object that is being validated by the evictor at this moment. Borrowed objects are unaffected.
+   */
+  public void destroyAllIdleObjects() {
+    clearEpoch.incrementAndGet();
+    int n = drainIdle("destroyAllIdleObjects");
+    log.info("Pool {}: destroyed {} idle objects, total now {}", name, n, total.get());
+  }
+
+  private int drainIdle(String reason) {
+    int             n = 0;
+    PooledObject<T> p;
+    while ((p = idle.pollFirst()) != null) {
+      destroy(p, reason);
+      n++;
+    }
+    return n;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Close
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Closes the pool. Idle objects are destroyed now. Borrowed objects stay usable and are
+   * destroyed when returned. Threads waiting in {@link #borrowObject()} are woken and throw
+   * {@link PoolClosedException}. Calling this on a closed pool does nothing.
+   */
+  @Override
+  public void close() {
+    if (!closeStarted.compareAndSet(false, true)) return;
+    closed = true;
+    log.info("Pool {}: closing (total={}, idle={}, borrowed={})", name, total.get(), idle.size(), borrowed.size());
+    if (maintenanceTask != null) maintenanceTask.cancel(false);
+    if (abandonTask != null) abandonTask.cancel(false);
+    signalAll();
+    drainIdle("pool closed");
+    log.info("Pool {}: closed, {} object(s) still borrowed and will be destroyed on return", name, borrowed.size());
+  }
+
+  /**
+   * Closes the pool and also destroys every borrowed object immediately. Callers still holding
+   * those objects will find them unusable. Use {@link #close()} unless you need this.
+   */
+  public void forceClose() {
+    close();
+    for (var entry : borrowed.entrySet()) {
+      reclaimBorrowed(entry.getKey(), entry.getValue(), "pool force-closed");
+    }
+  }
+
+  /** @return true once {@link #close()} or {@link #forceClose()} has been called */
+  public boolean isClosed() {
+    return closed;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Introspection
+  // ---------------------------------------------------------------------------------------------
+
+  public SimpleObjectPoolConfig config() {
+    return config;
+  }
 
   protected PooledObjectFactory<T> getFactory() {
     return factory;
   }
 
-  /**
-   * Checks if the object pool is closed by checking if the scheduler is shut down which
-   * would mean the pool is closed.
-   */
-  public boolean isClosed() {
-    return scheduler.isShutdown();
-  }
-
-  /**
-   * Returns the number of objects currently borrowed from the pool.
-   *
-   * @return the number of borrowed objects
-   */
+  /** @return objects currently handed out */
   public int borrowedObjectsCount() {
-    return borrowedObjects.size();
+    return borrowed.size();
   }
 
-  /**
-   * Returns the current total number of objects in the pool
-   *
-   * @return the current total number of objects in the pool
-   */
+  /** @return objects alive or being created */
   public int currentPoolSize() {
-    return currentPoolSize.get();
+    return total.get();
   }
 
-  /**
-   * Returns the number of idle objects currently available in the pool.
-   *
-   * @return the number of idle objects
-   */
+  /** @return objects in the idle queue; walks the queue, so avoid calling it in a hot loop */
   public int idleObjectCount() {
-    return idleObjects.size();
+    return idle.size();
   }
 
-  /**
-   * Returns the total number of objects created by this pool since its creation.
-   *
-   * @return the total number of objects created
-   */
+  /** @return objects created since construction */
   public long numOfObjectsCreated() {
-    return objectCreateCount.get();
+    return idSequence.get();
   }
 
-  /**
-   * Returns the number of threads currently waiting to acquire the lock.
-   * This information may be used for debugging or monitoring purposes.
-   *
-   * @return the number of waiting threads (approximate only)
-   */
+  /** @return threads currently blocked in {@link #borrowObject()} */
   public int waitingCount() {
-    return lock.getQueueLength();
+    return waiters.get();
   }
 
-
-  /**
-   * Returns the total number of times objects have been borrowed from this pool
-   * since its creation.
-   *
-   * @return the total number of times objects have been borrowed
-   */
+  /** @return successful borrows since construction */
   public long numOfTimesBorrowedFromPool() {
-    return timesBorrowed.get();
+    return borrowCount.sum();
   }
 
+  /**
+   * @return how many times the given object has been borrowed, or 0 if it is not part of this
+   * pool. Cheap for borrowed objects, a scan for idle ones.
+   */
+  public long numOfTimesBorrowed(T obj) {
+    if (obj == null) return 0;
+    PooledObject<T> p = borrowed.get(new IdentityKey(obj));
+    if (p == null) {
+      for (PooledObject<T> i : idle) {
+        if (i.object() == obj) {
+          p = i;
+          break;
+        }
+      }
+    }
+    return p == null ? 0 : p.borrowCount();
+  }
+
+  /** @return a snapshot of the pool's counters */
+  public PoolStats stats() {
+    return new PoolStats(total.get(), idle.size(), borrowed.size(), waiters.get(), idSequence.get(), destroyedCount.get(), borrowCount.sum(), maxPoolSize);
+  }
+
+  @Override
+  public String toString() {
+    return "SimpleObjectPool{name=" + name + ", " + stats() + '}';
+  }
+
+  /** Duration to nanoseconds without throwing on huge values. Negative stays negative; overflow saturates. */
+  private static long saturatedNanos(Duration d) {
+    try {
+      return d.toNanos();
+    } catch (ArithmeticException overflow) {
+      return d.isNegative() ? Long.MIN_VALUE : Long.MAX_VALUE;
+    }
+  }
 
   /**
-   * Returns the number of times a specific object has been borrowed from the pool
-   * since its creation.
-   * <p>
-   * Note that this method will only return statistics for objects that are currently
-   * borrowed from the pool. For objects that are idle this will have to iterate and will have a delay.
-   * If you need to check, check only for borrowed objects.
-   *
-   * @param objectId the id of the object to query, may be null
-   *
-   * @return the number of times the object has been borrowed
+   * Weak reference that compares referents by identity. Used for the reclaimed set. A key built
+   * with a null queue is a probe for lookups only.
    */
-  public long numOfTimesBorrowed(Long objectId) {
-    if (objectId == null) return 0;
-    var pooledObject = borrowedObjects.get(objectId);
-    if (pooledObject == null) {
-      log.warn("Object with id {} not found in borrowed objects", objectId);
-      pooledObject = idleObjects.stream()
-                                .filter(pooledObject1 -> pooledObject1.id().equals(objectId))
-                                .findAny().orElse(null);
+  private static final class WeakIdentityKey extends WeakReference<Object> {
+    private final int hash;
+
+    WeakIdentityKey(Object ref, ReferenceQueue<Object> queue) {
+      super(ref, queue);
+      this.hash = System.identityHashCode(ref);
     }
-    if (pooledObject == null) {
-      log.warn("Object with id {} not found in idle objects", objectId);
-      return 0;
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof WeakIdentityKey k)) return false;
+      Object mine = get();
+      return mine != null && mine == k.get();
     }
-    return pooledObject.timesBorrowed();
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+  }
+
+  /** Map key that compares the wrapped object by reference only. */
+  private static final class IdentityKey {
+    private final Object ref;
+
+    IdentityKey(Object ref) {
+      this.ref = ref;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      return o instanceof IdentityKey k && k.ref == ref;
+    }
+
+    @Override
+    public int hashCode() {
+      return System.identityHashCode(ref);
+    }
   }
 }

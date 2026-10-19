@@ -7,11 +7,11 @@
     <parent>
         <groupId>today.bonfire.oss</groupId>
         <artifactId>bonfire-oss-parent</artifactId>
-        <version>1.1.12</version>
+        <version>2.0.0</version>
     </parent>
 
     <artifactId>simple-object-pool</artifactId>
-    <version>2.4.0</version>
+    <version>3.0.0</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -23,13 +23,14 @@
     <name>${project.groupId}:${project.artifactId}</name>
     <description>A lightweight, thread-safe object pooling library for Java applications.
         Features:
-        - Thread-safe object pooling using ReentrantLock
+        - Thread-safe object pooling with lock-free idle queue and no factory I/O under locks
         - Configurable pool size with min and max limits
         - Automatic idle object eviction
-        - Abandoned object detection and cleanup
+        - Optional abandoned object detection (off by default)
         - Support for object validation and health checks
         - Simple and intuitive API
         - Zero external dependencies (except SLF4J for logging)
+        - Try-with-resources leases and functional borrow helpers
         - Java 21+ compatible
 
         Perfect for managing expensive resources like database connections, network sockets, or any reusable objects.
@@ -72,13 +73,18 @@
     <build>
         <plugins>
             <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludedGroups>performance</excludedGroups>
+                    <!-- Tests live in the same package as the module and use logback internals; run them on the classpath. -->
+                    <useModulePath>false</useModulePath>
+                </configuration>
+            </plugin>
+            <plugin>
                 <artifactId>maven-jar-plugin</artifactId>
                 <configuration>
                     <archive>
                         <manifestFile>${project.build.outputDirectory}/META-INF/MANIFEST.MF</manifestFile>
-                        <manifestEntries>
-                            <Automatic-Module-Name>${module.name}</Automatic-Module-Name>
-                        </manifestEntries>
                     </archive>
                 </configuration>
             </plugin>
@@ -98,5 +104,21 @@
         </plugins>
     </build>
 
-
+    <profiles>
+        <!-- mvn verify -Pperf runs only the tests tagged "performance" -->
+        <profile>
+            <id>perf</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <excludedGroups combine.self="override"></excludedGroups>
+                            <groups>performance</groups>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

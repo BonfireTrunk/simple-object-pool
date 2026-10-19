@@ -1,256 +1,238 @@
 package today.bonfire.oss.sop;
 
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.junit.jupiter.MockitoExtension;
-import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
+import org.junit.jupiter.api.Timeout;
 
 import java.time.Duration;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
-@ExtendWith(MockitoExtension.class)
+@Timeout(30)
 class SimpleObjectPoolConcurrencyTest {
 
-  private static final int  MAX_POOL_SIZE       = 5;
-  private static final int  MIN_POOL_SIZE       = 0;
-  private static final long IDLE_TIMEOUT        = 1000L;
-  private static final long ABANDONED_TIMEOUT   = 2000L;
-  private static final long OBJECT_WAIT_TIMEOUT = 100L;
-
-  private PooledObjectFactory<TestPoolObject> factory;
-
-  private SimpleObjectPool<TestPoolObject> pool;
-
-  @BeforeEach
-  void setUp() {
-    factory = mock();
-    pool    = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                           .maxPoolSize(MAX_POOL_SIZE)
-                                                           .minPoolSize(MIN_POOL_SIZE)
-                                                           .testWhileIdle(true)
-                                                           .testOnCreate(false)
-                                                           .waitingForObjectTimeout(Duration.ofMillis(OBJECT_WAIT_TIMEOUT))
-                                                           .durationBetweenEvictionsRuns(Duration.ofMillis(IDLE_TIMEOUT))
-                                                           .objEvictionTimeout(Duration.ofMillis(IDLE_TIMEOUT))
-                                                           .durationBetweenAbandonCheckRuns(Duration.ofMillis(ABANDONED_TIMEOUT))
-                                                           .abandonedTimeout(Duration.ofMillis(ABANDONED_TIMEOUT))
-                                                           .build(), factory);
-  }
-
-  @AfterEach
-  void tearDown() {
-    if (pool != null) {
-      pool.close();
-    }
-  }
+  private static final int      MAX_POOL_SIZE = 5;
+  private static final Duration AWAIT         = Duration.ofSeconds(10);
 
   @Test
   void testConcurrentBorrowAndReturn() throws Exception {
-    var config = pool.config().toBuilder()
-                     .maxPoolSize(MAX_POOL_SIZE)
-                     .abandonedTimeout(Duration.ofSeconds(10))
-                     .build();
-    var localPool = new SimpleObjectPool<>(config, factory);
+    var factory = new TestPooledObjectFactory();
+    // Generous wait: every thread must eventually get an object (the old test tolerated timeouts).
+    var config = SimpleObjectPoolConfig.builder()
+                                       .maxPoolSize(MAX_POOL_SIZE)
+                                       .waitingForObjectTimeout(Duration.ofSeconds(20))
+                                       .build();
 
-    int             numThreads      = MAX_POOL_SIZE * 2;
-    ExecutorService executor        = Executors.newVirtualThreadPerTaskExecutor();
-    CountDownLatch  startLatch      = new CountDownLatch(1);
-    CountDownLatch  completionLatch = new CountDownLatch(numThreads);
+    int           numThreads = MAX_POOL_SIZE * 4;
+    AtomicInteger successful = new AtomicInteger();
+    AtomicInteger inUse      = new AtomicInteger();
+    AtomicInteger maxInUse   = new AtomicInteger();
+    CountDownLatch start     = new CountDownLatch(1);
 
-    AtomicInteger successfulBorrows = new AtomicInteger(0);
-    when(factory.createObject()).thenAnswer(inv -> new TestPoolObject());
-
-    // Create tasks that borrow and return objects
-    for (int i = 0; i < numThreads; i++) {
-      executor.submit(() -> {
-        try {
-          startLatch.await();
-          TestPoolObject obj = localPool.borrowObject();
+    try (var pool = new SimpleObjectPool<>(config, factory);
+         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      List<Future<?>> futures = new ArrayList<>();
+      for (int i = 0; i < numThreads; i++) {
+        futures.add(executor.submit(() -> {
+          start.await();
+          TestPoolObject obj = pool.borrowObject();
           assertThat(obj).isNotNull();
-          successfulBorrows.incrementAndGet();
-          Thread.sleep(10); // Simulate some work
-          localPool.returnObject(obj);
-        } catch (Exception e) {
-          // Expected some threads to fail due to pool exhaustion
-          assertThat(e)
-              .as("Failed threads should throw PoolTimeoutException")
-              .isInstanceOf(PoolTimeoutException.class);
-        } finally {
-          completionLatch.countDown();
-        }
-      });
+          maxInUse.accumulateAndGet(inUse.incrementAndGet(), Math::max);
+          successful.incrementAndGet();
+          TestSupport.sleepQuietly(10); // simulated work
+          inUse.decrementAndGet();
+          pool.returnObject(obj);
+          return null;
+        }));
+      }
+      start.countDown();
+      for (var f : futures) {
+        f.get(20, TimeUnit.SECONDS);
+      }
+
+      assertThat(successful.get()).isEqualTo(numThreads);
+      assertThat(maxInUse.get()).as("never more objects out than maxPoolSize").isLessThanOrEqualTo(MAX_POOL_SIZE);
+      assertThat(pool.currentPoolSize()).isLessThanOrEqualTo(MAX_POOL_SIZE);
+      assertThat(factory.getIdCounter().get()).isLessThanOrEqualTo(MAX_POOL_SIZE);
+      assertThat(pool.borrowedObjectsCount()).isZero();
+      assertThat(pool.waitingCount()).isZero();
     }
-
-    startLatch.countDown();
-    assertThat(completionLatch.await(10, TimeUnit.SECONDS))
-        .as("All threads should complete within timeout")
-        .isTrue();
-    executor.shutdown();
-    assertThat(executor.awaitTermination(5, TimeUnit.SECONDS))
-        .as("Executor should terminate within timeout")
-        .isTrue();
-
-    assertThat(successfulBorrows.get())
-        .as("Should have some successful borrows")
-        .isGreaterThan(MAX_POOL_SIZE);
-    assertThat(localPool.currentPoolSize())
-        .as("Pool size should not exceed maximum")
-        .isLessThanOrEqualTo(MAX_POOL_SIZE);
-
-    localPool.close();
   }
 
   @Test
   void testConcurrentReturnObject() throws Exception {
     var factory = new TestPooledObjectFactory();
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
-                                                            .build(), factory);
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(MAX_POOL_SIZE).build(), factory);
+         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      TestPoolObject borrowed = pool.borrowObject();
 
-    TestPoolObject borrowed = pool.borrowObject();
-
-    // Start two threads trying to return the same object
-    CountDownLatch startLatch = new CountDownLatch(1);
-    CountDownLatch doneLatch  = new CountDownLatch(2);
-
-    ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    for (int i = 0; i < 2; i++) {
-      executor.submit(() -> {
-        try {
+      CountDownLatch startLatch = new CountDownLatch(1);
+      AtomicInteger  succeeded  = new AtomicInteger();
+      AtomicInteger  rejected   = new AtomicInteger();
+      List<Future<?>> futures   = new ArrayList<>();
+      for (int i = 0; i < 2; i++) {
+        futures.add(executor.submit(() -> {
           startLatch.await();
-          pool.returnObject(borrowed);
-        } catch (Exception e) {
-          // Expected for one thread
-        } finally {
-          doneLatch.countDown();
-        }
-      });
+          try {
+            pool.returnObject(borrowed);
+            succeeded.incrementAndGet();
+          } catch (today.bonfire.oss.sop.exceptions.PoolObjectException e) {
+            rejected.incrementAndGet();
+          }
+          return null;
+        }));
+      }
+      startLatch.countDown();
+      for (var f : futures) {
+        f.get(10, TimeUnit.SECONDS);
+      }
+
+      // v3: exactly one return wins, the other is rejected, and the object is idle exactly once.
+      assertThat(succeeded.get()).isEqualTo(1);
+      assertThat(rejected.get()).isEqualTo(1);
+      assertThat(pool.idleObjectCount()).isEqualTo(1);
+      assertThat(pool.borrowObject()).isSameAs(borrowed);
     }
-
-    startLatch.countDown();
-    assertThat(doneLatch.await(5, TimeUnit.SECONDS))
-        .as("Both threads should complete")
-        .isTrue();
-
-    executor.shutdown();
-    assertThat(executor.awaitTermination(1, TimeUnit.SECONDS))
-        .as("Executor should terminate")
-        .isTrue();
-
-    // Object should still be valid and in the pool
-    TestPoolObject borrowedAgain = pool.borrowObject();
-    assertThat(borrowedAgain).isSameAs(borrowed);
-    pool.close();
   }
 
   @Test
-  void testConcurrentBorrowWithSlowValidation() throws Exception {
+  void testConcurrentBorrowGetsDistinctObjects() throws Exception {
     var factory = new TestPooledObjectFactory();
-    factory.setValidationDelayMillis(500); // 500ms validation delay
+    factory.setCreationDelayMillis(100); // simulated slow creation
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(MAX_POOL_SIZE)
+                                                                 .testOnBorrow(true)
+                                                                 .waitingForObjectTimeout(Duration.ofSeconds(5))
+                                                                 .build(), factory);
+         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      CountDownLatch startLatch = new CountDownLatch(1);
+      List<Future<TestPoolObject>> futures = new ArrayList<>();
+      for (int i = 0; i < 3; i++) {
+        futures.add(executor.submit(() -> {
+          startLatch.await();
+          return pool.borrowObject();
+        }));
+      }
+      startLatch.countDown();
 
-    var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
-                                                            .maxPoolSize(MAX_POOL_SIZE)
-                                                            .minPoolSize(MIN_POOL_SIZE)
-                                                            .testOnBorrow(true)
-                                                            .waitingForObjectTimeout(Duration.ofSeconds(2))
-                                                            .build(), factory);
+      Set<Long> seqs = new HashSet<>();
+      List<TestPoolObject> objs = new ArrayList<>();
+      for (var f : futures) {
+        TestPoolObject o = f.get(10, TimeUnit.SECONDS);
+        assertThat(o).isNotNull();
+        seqs.add(o.seq());
+        objs.add(o);
+      }
+      assertThat(seqs).as("distinct instances").hasSize(3);
+      for (var o : objs) {
+        pool.returnObject(o);
+      }
+    }
+  }
 
-    ExecutorService executor   = Executors.newVirtualThreadPerTaskExecutor();
-    CountDownLatch  startLatch = new CountDownLatch(1);
+  @Test
+  void testCreationsRunInParallel() throws Exception {
+    // Each createObject() blocks until two creations are in flight at once. If the pool serialised
+    // factory calls, the second would never arrive and the latch would time out.
+    CountDownLatch bothInFlight = new CountDownLatch(2);
+    AtomicInteger  timedOut     = new AtomicInteger();
+    var factory = new PooledObjectFactory<TestPoolObject>() {
+      @Override
+      public TestPoolObject createObject() {
+        bothInFlight.countDown();
+        try {
+          if (!bothInFlight.await(5, TimeUnit.SECONDS)) timedOut.incrementAndGet();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        return new TestPoolObject();
+      }
 
-    Future<TestPoolObject> future1 = executor.submit(() -> {
-      startLatch.await();
-      return pool.borrowObject();
-    });
+      @Override
+      public void destroyObject(TestPoolObject obj) {
+        obj.destroy();
+      }
+    };
 
-    Future<TestPoolObject> future2 = executor.submit(() -> {
-      startLatch.await();
-      return pool.borrowObject();
-    });
-
-    startLatch.countDown();
-
-    TestPoolObject borrowed1 = future1.get(2500, TimeUnit.MILLISECONDS);
-    TestPoolObject borrowed2 = future2.get(2500, TimeUnit.MILLISECONDS);
-
-    assertThat(borrowed1)
-        .as("First entity should not be null")
-        .isNotNull();
-    assertThat(borrowed2)
-        .as("Second entity should not be null")
-        .isNotNull();
-    assertThat(borrowed1.getEntityId())
-        .as("Entities should have different IDs")
-        .isNotEqualTo(borrowed2.getEntityId());
-
-    executor.shutdown();
-    assertThat(executor.awaitTermination(1, TimeUnit.SECONDS))
-        .as("Executor should terminate")
-        .isTrue();
-
-    pool.returnObject(borrowed1);
-    pool.returnObject(borrowed2);
-    pool.close();
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder().maxPoolSize(2).build(), factory);
+         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      Future<TestPoolObject> a = executor.submit(() -> pool.borrowObject());
+      Future<TestPoolObject> b = executor.submit(() -> pool.borrowObject());
+      TestPoolObject oa = a.get(10, TimeUnit.SECONDS);
+      TestPoolObject ob = b.get(10, TimeUnit.SECONDS);
+      assertThat(timedOut.get()).as("creations overlapped").isZero();
+      assertThat(oa).isNotSameAs(ob);
+      pool.returnObject(oa);
+      pool.returnObject(ob);
+    }
   }
 
   @Test
   void testWaitingThreadWakesOnDestruction() throws Exception {
     var factory = new TestPooledObjectFactory();
-    factory.setValidationDelayMillis(10);
-    // Max pool size 1, min 0
+    try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
+                                                                 .maxPoolSize(1)
+                                                                 .waitingForObjectTimeout(Duration.ofSeconds(10))
+                                                                 .testOnReturn(true)
+                                                                 .build(), factory);
+         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      TestPoolObject obj1 = pool.borrowObject();
+
+      Future<TestPoolObject> waiter = executor.submit(() -> pool.borrowObject());
+      TestSupport.awaitUntil("borrower parked", AWAIT, () -> pool.waitingCount() == 1);
+
+      // Returning as broken destroys the object and frees the slot; the waiter must wake and create a new one.
+      pool.returnObject(obj1, true);
+
+      TestPoolObject obj2 = waiter.get(10, TimeUnit.SECONDS);
+      assertThat(obj2).isNotNull().isNotSameAs(obj1);
+      assertThat(obj1.isDestroyed()).isTrue();
+      assertThat(pool.currentPoolSize()).isEqualTo(1);
+      pool.returnObject(obj2);
+    }
+  }
+
+  @Test
+  void testCloseWakesAllParkedBorrowers() throws Exception {
+    var factory = new TestPooledObjectFactory();
     var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
                                                             .maxPoolSize(1)
-                                                            .minPoolSize(0)
-                                                            .waitingForObjectTimeout(Duration.ofSeconds(2))
-                                                            .testOnReturn(true)
+                                                            .waitingForObjectTimeout(Duration.ofSeconds(-1))
                                                             .build(), factory);
-
-    // 1. Borrow the only available slot
-    TestPoolObject obj1 = pool.borrowObject();
-    assertThat(obj1).isNotNull();
-
-    // 2. Start a second thread that tries to borrow. It should wait because pool is
-    // full.
-    CountDownLatch  startLatch   = new CountDownLatch(1);
-    AtomicInteger   successCount = new AtomicInteger(0);
-    ExecutorService executor     = Executors.newSingleThreadExecutor();
-    Future<?> future = executor.submit(() -> {
-      try {
-        startLatch.countDown();
-        TestPoolObject obj2 = pool.borrowObject();
-        if (obj2 != null) {successCount.incrementAndGet();}
-      } catch (Exception e) {
-        // e.printStackTrace();
+    try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      TestPoolObject held = pool.borrowObject();
+      List<Future<TestPoolObject>> waiters = new ArrayList<>();
+      for (int i = 0; i < 4; i++) {
+        waiters.add(executor.submit(() -> pool.borrowObject()));
       }
-    });
+      TestSupport.awaitUntil("all borrowers parked", AWAIT, () -> pool.waitingCount() == 4);
 
-    startLatch.await();
-    Thread.sleep(100); // Give it time to enter wait
+      pool.close();
 
-    // 3. Return obj1 as BROKEN. This should destroy it, decrement size to 0.
-    // If we signal, the updating thread should wake up, see size < max, and create
-    // a new object.
-    pool.returnObject(obj1, true);
-
-    // 4. Wait for thread to finish
-    try {
-      future.get(1000, TimeUnit.MILLISECONDS);
-    } catch (java.util.concurrent.TimeoutException e) {
-      // Expected failure currently
+      List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+      for (var w : waiters) {
+        try {
+          w.get(10, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.ExecutionException e) {
+          failures.add(e.getCause());
+        }
+      }
+      assertThat(failures).hasSize(4).allMatch(t -> t instanceof today.bonfire.oss.sop.exceptions.PoolClosedException);
+      TestSupport.awaitUntil("waiters drained", AWAIT, () -> pool.waitingCount() == 0);
+      pool.returnObject(held);
+      assertThat(held.isDestroyed()).isTrue();
+    } finally {
+      pool.forceClose();
     }
-
-    // Check results
-    assertThat(successCount.get()).isEqualTo(1);
-
-    executor.shutdownNow();
-    pool.close();
   }
 }
