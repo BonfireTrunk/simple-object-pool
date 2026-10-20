@@ -110,7 +110,7 @@ Timing and configuration:
 
 - The library contains no `synchronized` block and no `Object.wait()`. All blocking goes
   through `java.util.concurrent` locks and conditions, so virtual threads never pin a carrier
-  on JDK 21.
+  on JDK 21 to 23, and on later JDKs no borrower ever queues behind a monitor.
 - One shared daemon thread ticks maintenance for every pool in the JVM. Each run executes on
   a virtual thread named after the pool. Pools no longer own a non-daemon thread each, and
   nothing is scheduled for features that are disabled.

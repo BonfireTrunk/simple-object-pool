@@ -73,6 +73,24 @@
     <build>
         <plugins>
             <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <!-- Tests compile as a patch of the library module, which does not read jdk.jfr.
+                                 The pinning guard test records JFR events, so let test code see it. -->
+                            <compilerArgs combine.children="append">
+                                <arg>--add-modules</arg>
+                                <arg>jdk.jfr</arg>
+                                <arg>--add-reads</arg>
+                                <arg>${module.name}=jdk.jfr</arg>
+                            </compilerArgs>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
                     <excludedGroups>performance</excludedGroups>

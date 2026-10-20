@@ -22,8 +22,10 @@ connections, sockets, parsers, buffers, HTTP clients.
 
 Most Java pools predate virtual threads and still lean on `synchronized` for their state
 transitions. That was fine for a few hundred platform threads. It is not fine when ten thousand
-virtual threads share thirty connections, because a virtual thread that blocks inside a
-`synchronized` block pins its carrier thread, and the whole point of virtual threads goes away.
+virtual threads share thirty connections. On JDK 21 to 23 a virtual thread that blocks inside a
+`synchronized` block pins its carrier thread, so the pool quietly turns virtual threads back
+into platform threads. JDK 24 fixed the pinning, but a monitor held across a deque operation or
+a factory call is still a point where every borrower and returner queues up behind one thread.
 
 This pool takes a different approach:
 
@@ -37,7 +39,7 @@ This pool takes a different approach:
   to park the caller until something frees up.
 - There is no `synchronized` and no `Object.wait()` anywhere in the library. Under JDK Flight
   Recorder it produces zero `jdk.VirtualThreadPinned` events on JDK 21, with or without
-  factory validation turned on.
+  factory validation turned on, and on JDK 25 the only events come from the JDK itself.
 
 ## Quick start
 

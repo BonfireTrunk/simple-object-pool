@@ -569,8 +569,12 @@ class SimpleObjectPoolTest {
     awaitUntil("least used object to be evicted", AWAIT, () -> localPool.currentPoolSize() == 1);
     verify(factory).destroyObject(obj2);
 
-    var borrowedAgain = localPool.borrowObject();
-    assertThat(borrowedAgain).isSameAs(borrowed1);
+    // The survivor must be obj1. Checked through pool state rather than a borrow: later scheduled
+    // runs keep taking obj1 out of the idle queue for its idle test, and a borrow that lands in
+    // that window creates a third object instead of handing obj1 back.
+    verify(factory, never()).destroyObject(obj1);
+    assertThat(localPool.numOfObjectsCreated()).isEqualTo(2);
+    assertThat(localPool.currentPoolSize()).isEqualTo(1);
   }
 
   @Test
@@ -607,8 +611,10 @@ class SimpleObjectPoolTest {
     awaitUntil("most used object to be evicted", AWAIT, () -> localPool.currentPoolSize() == 1);
     verify(factory).destroyObject(obj1);
 
-    var borrowedAgain = localPool.borrowObject();
-    assertThat(borrowedAgain).isSameAs(borrowed2);
+    // Same reasoning as the LEAST_USED test: assert the survivor through state, not a racy borrow.
+    verify(factory, never()).destroyObject(obj2);
+    assertThat(localPool.numOfObjectsCreated()).isEqualTo(2);
+    assertThat(localPool.currentPoolSize()).isEqualTo(1);
   }
 
   @Test
