@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0
+## [3.0.0] - 2026-10-28
 
 This release rewrites the pool core. The 2.x design kept one lock across borrow, return and
 eviction, and held it while calling your factory, so a single slow connection could stall
@@ -115,8 +115,4 @@ Timing and configuration:
   a virtual thread named after the pool. Pools no longer own a non-daemon thread each, and
   nothing is scheduled for features that are disabled.
 - Parent POM moved to `bonfire-oss-parent` 2.0.0 (JUnit 6, Mockito 5.24, Logback 1.6).
-- The performance test runs only under `mvn verify -Pperf`.
-
-## 2.4.0 and earlier
-
-See the git history.
+- The performance test runs only under `./mvnw verify -Pperf`.

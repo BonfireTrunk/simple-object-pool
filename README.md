@@ -225,19 +225,30 @@ is in [CHANGELOG.md](CHANGELOG.md). The short version:
 ## Building
 
 ```bash
-mvn verify            # unit tests
-mvn verify -Pperf     # also runs the performance test
+./mvnw verify            # unit tests
+./mvnw verify -Pperf     # also runs the performance test
 ```
 
-You need JDK 21 or newer. The library itself depends only on SLF4J.
+You need JDK 21 or newer. The Maven Wrapper downloads the pinned Maven version, so no local
+Maven install is needed. The library itself depends only on SLF4J.
 
 ## Contributing
 
-Bug reports and pull requests are welcome at
-[github.com/BonfireTrunk/simple-object-pool](https://github.com/BonfireTrunk/simple-object-pool).
-Please run `mvn verify` before opening a pull request, and add a test for any change in
-behaviour. For concurrency fixes, a test that fails without the fix is worth more than the fix
-itself. Formatting follows the `eclipse-formatter.xml` in the repository root.
+Follow the [contributing guide](https://github.com/BonfireTrunk/.github/blob/prime/CONTRIBUTING.md).
+What is specific to this repository:
+
+- **Build.** Needs Java 21 or newer. The Maven Wrapper downloads the pinned Maven version, so no
+  local Maven install is needed:
+  ```bash
+  ./mvnw verify
+  ```
+- **Tests.** Add a test for any change in behaviour. For concurrency fixes, a test that fails
+  without the fix is worth more than the fix itself.
+- **Formatting** follows the `eclipse-formatter.xml` in the repository root.
+- **Version.** Leave the version in `pom.xml` alone, with one exception: if it is a release
+  version (no `-SNAPSHOT` suffix), yours is the first change since that release, so bump it to
+  the next snapshot. For a bug fix, `3.0.0` becomes `3.0.1-SNAPSHOT`; for a new feature,
+  `3.0.0` becomes `3.1.0-SNAPSHOT`.
 
 ## License
 
