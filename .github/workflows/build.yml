@@ -1,7 +1,5 @@
 name: build
 
-# Builds every pull request. Runs with a read-only token and no secrets, so a
-# contributor's code cannot publish anything or reach the release keys.
 on:
   pull_request:
 
@@ -14,17 +12,4 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
-
-      - name: Build and test
-        run: ./mvnw -B -ntp verify
+    uses: BonfireTrunk/.github/.github/workflows/maven-build.yml@prime
