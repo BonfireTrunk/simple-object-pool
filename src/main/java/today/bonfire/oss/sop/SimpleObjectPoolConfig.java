@@ -98,6 +98,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the maximum number of objects that the pool can hold.
+   *
+   * @return The maximum pool size.
    */
   public int maxPoolSize() {
     return maxPoolSize;
@@ -105,6 +107,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the minimum number of idle objects that the pool should maintain.
+   *
+   * @return The minimum number of idle objects.
    */
   public int minPoolSize() {
     return minPoolSize;
@@ -172,6 +176,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the duration between runs of the abandoned object check.
+   *
+   * @return The duration between abandoned object check runs.
    */
   public Duration durationBetweenAbandonCheckRuns() {
     return durationBetweenAbandonCheckRuns;
@@ -197,6 +203,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the duration between runs of the eviction process.
+   *
+   * @return The duration between eviction runs.
    */
   public Duration durationBetweenEvictionsRuns() {
     return durationBetweenEvictionsRuns;
@@ -204,6 +212,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the timeout duration for an idle object to be considered for eviction.
+   *
+   * @return The object eviction timeout.
    */
   public Duration objEvictionTimeout() {
     return objEvictionTimeout;
@@ -221,6 +231,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the eviction policy to use when evicting objects from the pool.
+   *
+   * @return The eviction policy.
    */
   public EvictionPolicy evictionPolicy() {
     return evictionPolicy;
@@ -229,6 +241,8 @@ public class SimpleObjectPoolConfig {
   /**
    * Returns the maximum number of creation retries when borrowing an object from the pool.
    * Zero means exactly one creation attempt per borrow.
+   *
+   * @return The maximum number of retries.
    */
   public int maxRetries() {
     return maxRetries;
@@ -237,6 +251,8 @@ public class SimpleObjectPoolConfig {
   /**
    * Returns the delay between retries when creating objects for the pool.
    * This is applicable during the object creation failure scenario.
+   *
+   * @return The retry delay.
    */
   public Duration retryCreationDelay() {
     return retryCreationDelay;
@@ -244,6 +260,8 @@ public class SimpleObjectPoolConfig {
 
   /**
    * Returns the timeout duration for waiting for an object to become available in the pool.
+   *
+   * @return The waiting for object timeout.
    */
   public Duration waitingForObjectTimeout() {
     return waitingForObjectTimeout;
@@ -296,6 +314,10 @@ public class SimpleObjectPoolConfig {
     NONE
   }
 
+  /**
+   * {@code Builder} is a builder for {@link SimpleObjectPoolConfig}.
+   * It allows for a flexible and readable configuration setup.
+   */
   public static class Builder {
     private String         poolName                        = "SOP-" + UUID.randomUUID().toString().substring(28).toUpperCase();
     private int            maxPoolSize                     = 8;
@@ -321,6 +343,8 @@ public class SimpleObjectPoolConfig {
      * <p>
      * The name is used for logging and debugging purposes. It must not be null or blank.
      *
+     * @param poolName The name of the pool.
+     *
      * @return This {@code Builder} instance.
      */
     public Builder poolName(String poolName) {
@@ -330,6 +354,8 @@ public class SimpleObjectPoolConfig {
 
     /**
      * Sets the maximum number of objects that the pool can hold.
+     *
+     * @param maxPoolSize The maximum pool size.
      *
      * @return This {@code Builder} instance.
      */
@@ -344,6 +370,8 @@ public class SimpleObjectPoolConfig {
      * of idle objects rather it suggests that the pool should attempt to maintain the specified number of idle objects.
      * The scheduled maintenance task tops the pool up to this number, so a positive value requires a positive
      * {@code durationBetweenEvictionsRuns} even when the eviction policy is {@link EvictionPolicy#NONE}.
+     *
+     * @param minPoolSize The minimum number of idle objects.
      *
      * @return This {@code Builder} instance.
      */
@@ -437,6 +465,9 @@ public class SimpleObjectPoolConfig {
      * Sets the duration between runs of the abandoned object check.
      * Must be positive when abandon detection is enabled; ignored otherwise.
      *
+     * @param durationBetweenAbandonCheckRuns The duration between abandoned object
+     *                                        check runs.
+     *
      * @return This {@code Builder} instance.
      */
     public Builder durationBetweenAbandonCheckRuns(Duration durationBetweenAbandonCheckRuns) {
@@ -466,6 +497,8 @@ public class SimpleObjectPoolConfig {
      * Must be positive unless the eviction policy is {@link EvictionPolicy#NONE} and {@code minPoolSize} is 0,
      * because the same scheduled task also maintains {@code minPoolSize}.
      *
+     * @param durationBetweenEvictionsRuns The duration between eviction runs.
+     *
      * @return This {@code Builder} instance.
      */
     public Builder durationBetweenEvictionsRuns(Duration durationBetweenEvictionsRuns) {
@@ -481,6 +514,8 @@ public class SimpleObjectPoolConfig {
      * Note: if you want eviction only based on object validation then set
      * this to a very high value in the range of hours or days.
      * </p>
+     *
+     * @param objEvictionTimeout The object eviction timeout duration.
      *
      * @return This {@code Builder} instance.
      */
@@ -501,6 +536,9 @@ public class SimpleObjectPoolConfig {
      * If set to null or not set then the factory validation will be limited to
      * {@code maxPoolSize}.
      *
+     * @param numValidationsPerEvictionRun The number of objects to test per
+     *                                     eviction run.
+     *
      * @return This {@code Builder} instance.
      */
     public Builder numValidationsPerEvictionRun(Integer numValidationsPerEvictionRun) {
@@ -511,6 +549,8 @@ public class SimpleObjectPoolConfig {
     /**
      * Sets the eviction policy to use when evicting objects from the pool.
      * Defaults to {@link EvictionPolicy#RANDOM} if not set.
+     *
+     * @param evictionPolicy The eviction policy.
      *
      * @return This {@code Builder} instance.
      */
@@ -540,6 +580,8 @@ public class SimpleObjectPoolConfig {
      * A bounded borrow sleeps no longer than its remaining wait and does not make another creation attempt
      * after that wait has elapsed.
      *
+     * @param retryCreationDelay The retry delay.
+     *
      * @return This {@code Builder} instance.
      */
     public Builder retryCreationDelay(Duration retryCreationDelay) {
@@ -556,6 +598,8 @@ public class SimpleObjectPoolConfig {
      *   <li>Positive: wait at most the given duration.</li>
      * </ul>
      * Waiting indefinitely is not recommended, rather handle the cases with shorter timeouts.
+     *
+     * @param waitingForObjectTimeout The waiting for object timeout duration.
      *
      * @return This {@code Builder} instance.
      */

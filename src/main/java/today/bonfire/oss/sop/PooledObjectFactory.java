@@ -28,6 +28,8 @@ public interface PooledObjectFactory<T> {
   /**
    * Releases any resources held by the object. Called exactly once per object, from the
    * thread that removed it from the pool. Exceptions are logged and swallowed.
+   *
+   * @param obj the object to destroy
    */
   void destroyObject(T obj);
 
@@ -37,6 +39,8 @@ public interface PooledObjectFactory<T> {
    * during an idle test. An exception marks the object invalid and it is destroyed. On a newly
    * created object the failure counts as a creation failure, and once retries are exhausted the
    * borrower gets the exception unchanged.
+   *
+   * @param obj the object to activate
    */
   default void activateObject(T obj) {
   }
@@ -44,6 +48,8 @@ public interface PooledObjectFactory<T> {
   /**
    * Resets an object that is being returned to the idle queue, and after each validation
    * during an idle test. An exception marks the object invalid and it is destroyed.
+   *
+   * @param obj the object to passivate
    */
   default void passivateObject(T obj) {
   }
@@ -55,6 +61,7 @@ public interface PooledObjectFactory<T> {
    * failure and surfaces as {@link today.bonfire.oss.sop.exceptions.PoolObjectValidationException}
    * once retries are exhausted. Keep this fast; put expensive checks in {@link #isObjectValid(Object)}.
    *
+   * @param obj the object to check
    * @return true if the object may be borrowed
    */
   default boolean isObjectValidForBorrow(T obj) {
@@ -65,6 +72,7 @@ public interface PooledObjectFactory<T> {
    * A thorough check run on create ({@code testOnCreate}), on return ({@code testOnReturn})
    * and during idle tests ({@code testWhileIdle}). Returning false destroys the object.
    *
+   * @param obj the object to check
    * @return true if the object is still usable
    */
   default boolean isObjectValid(T obj) {
@@ -77,6 +85,7 @@ public interface PooledObjectFactory<T> {
    * regardless of idle time or {@code minPoolSize}. Use it to retire objects on external
    * signals, for example a server asking clients to reconnect.
    *
+   * @param obj  the idle object
    * @param info the pool's bookkeeping for that object
    * @return true to evict and destroy the object
    */
@@ -93,6 +102,8 @@ public interface PooledObjectFactory<T> {
    * leave them intact, for example an error reply that was read in full. If this method throws,
    * the object is destroyed. Leases and direct {@code returnObject} calls do not consult it.
    *
+   * @param obj   the object the action was using
+   * @param error what the action threw
    * @return true to destroy the object, false to return it to the pool
    */
   default boolean isBrokenBy(T obj, Throwable error) {
