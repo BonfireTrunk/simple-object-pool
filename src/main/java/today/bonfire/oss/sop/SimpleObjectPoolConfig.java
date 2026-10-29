@@ -310,7 +310,7 @@ public class SimpleObjectPoolConfig {
     OLDEST_FIRST,
     LEAST_USED,
     MOST_USED,
-    RANDOM, // Default fastest
+    RANDOM, // the default; a shuffle costs less than the ordered policies' sort
     NONE
   }
 

@@ -23,7 +23,7 @@ class SimpleObjectPoolEdgeCaseTest {
   @Test
   void testZeroIdleEvictionTimeout() {
     var factory = new TestPooledObjectFactory();
-    // minPoolSize is 0: v3 never evicts below minPoolSize, so a zero idle timeout needs min 0 to take effect.
+    // minPoolSize is 0: the pool never evicts below minPoolSize, so a zero idle timeout needs min 0 to take effect.
     try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
                                                                  .maxPoolSize(MAX_POOL_SIZE)
                                                                  .minPoolSize(0)
@@ -121,7 +121,6 @@ class SimpleObjectPoolEdgeCaseTest {
       TestPoolObject borrowed = pool.borrowObject();
       pool.returnObject(borrowed);
 
-      // v3: a second return is rejected instead of silently ignored.
       assertThatThrownBy(() -> pool.returnObject(borrowed)).isInstanceOf(PoolObjectException.class);
 
       assertThat(pool.idleObjectCount()).isEqualTo(1);

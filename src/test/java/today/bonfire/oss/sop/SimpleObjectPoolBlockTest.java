@@ -56,7 +56,6 @@ class SimpleObjectPoolBlockTest {
       assertThatThrownBy(pool::borrowObject).isInstanceOf(PoolTimeoutException.class);
       long durationMs = Duration.ofNanos(System.nanoTime() - start).toMillis();
 
-      // Positive timeout: waited for (at least) the timeout before giving up.
       assertThat(durationMs).isGreaterThanOrEqualTo(500);
       assertThat(pool.waitingCount()).isZero();
     }
@@ -99,7 +98,6 @@ class SimpleObjectPoolBlockTest {
 
       pool.close();
 
-      // v3: close() wakes parked borrowers and they fail with PoolClosedException.
       assertThatThrownBy(() -> waiter.get(10, java.util.concurrent.TimeUnit.SECONDS))
           .hasRootCauseInstanceOf(PoolClosedException.class);
     } finally {

@@ -66,7 +66,6 @@ class SimpleObjectPoolHardeningTest {
       var evictor = Thread.ofVirtual().start(pool::evict);
       awaitUntil("evictor removed the object from idle for testing", AWAIT, () -> pool.idleObjectCount() == 0 && pool.currentPoolSize() == 1);
 
-      // clear() while the only object is being validated
       pool.destroyAllIdleObjects();
       assertThat(pool.currentPoolSize()).as("object under test still counted until the test finishes").isEqualTo(1);
 
@@ -121,7 +120,7 @@ class SimpleObjectPoolHardeningTest {
       TestPoolObject a = pool.borrowObject();
       TestPoolObject b = pool.borrowObject();
       TestPoolObject c = pool.borrowObject();
-      // 3 borrowed, 2 idle, total 5. Old rule (total > minPoolSize) evicted both idle objects and recreated them.
+      // 3 borrowed, 2 idle: eviction compares the idle count with minPoolSize, not the total.
       pool.evict();
       assertThat(factory.destroyed.get()).as("idle count equals minPoolSize, nothing to evict").isZero();
       assertThat(pool.idleObjectCount()).isEqualTo(2);

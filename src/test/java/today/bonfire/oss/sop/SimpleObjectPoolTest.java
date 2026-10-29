@@ -110,7 +110,6 @@ class SimpleObjectPoolTest {
     assertThat(pool.numOfObjectsCreated()).isEqualTo(1);
     assertThat(pool.numOfTimesBorrowedFromPool()).isEqualTo(2);
 
-    // v3: per-object stats are looked up by the object itself, not by an entity id
     assertThat(pool.numOfTimesBorrowed(b2)).isEqualTo(2);
   }
 
@@ -119,8 +118,8 @@ class SimpleObjectPoolTest {
     var config = SimpleObjectPoolConfig.builder()
                                        .maxPoolSize(10)
                                        .minPoolSize(0)
-                                       .objEvictionTimeout(Duration.ofMillis(1)) // Instant expiration
-                                       .numValidationsPerEvictionRun(1) // Only limits scheduled runs
+                                       .objEvictionTimeout(Duration.ofMillis(1))
+                                       .numValidationsPerEvictionRun(1)
                                        .build();
     var localPool = newPool(config, factory);
 
@@ -129,7 +128,6 @@ class SimpleObjectPoolTest {
     TestPoolObject o3 = new TestPoolObject();
     when(factory.createObject()).thenReturn(o1).thenReturn(o2).thenReturn(o3);
 
-    // Create 3 idle objects
     var b1 = localPool.borrowObject();
     var b2 = localPool.borrowObject();
     var b3 = localPool.borrowObject();
@@ -152,14 +150,12 @@ class SimpleObjectPoolTest {
   @Test
   void testReturnForeignObject() {
     TestPoolObject foreign = new TestPoolObject();
-    // v3: returning an object that is not borrowed from the pool throws (it used to log and return)
     assertThatThrownBy(() -> pool.returnObject(foreign)).isInstanceOf(PoolObjectException.class);
     assertThat(pool.currentPoolSize()).isEqualTo(0);
   }
 
   @Test
   void testReturnNullObject() {
-    // v3: null is rejected with PoolObjectException and a reworded message
     assertThatThrownBy(() -> pool.returnObject(null))
         .isInstanceOf(PoolObjectException.class)
         .hasMessageContaining("Cannot return null");
@@ -173,7 +169,6 @@ class SimpleObjectPoolTest {
     TestPoolObject borrowed = pool.borrowObject();
     assertThat(borrowed).isSameAs(entity);
     verify(factory, times(1)).createObject();
-    // A freshly created object is activated and then tested on borrow, like an idle one.
     var order = inOrder(factory);
     order.verify(factory).activateObject(entity);
     order.verify(factory).isObjectValidForBorrow(entity);
@@ -188,7 +183,6 @@ class SimpleObjectPoolTest {
     TestPoolObject borrowed = pool.borrowObject();
     pool.returnObject(borrowed);
 
-    // The fresh object was tested on its first borrow
     verify(factory, times(1)).isObjectValidForBorrow(entity);
 
     TestPoolObject borrowedAgain = pool.borrowObject();
@@ -208,7 +202,6 @@ class SimpleObjectPoolTest {
       assertThat(pool.borrowObject()).isNotNull();
     }
 
-    // Next borrow should time out (message reworded in v3)
     assertThatThrownBy(() -> pool.borrowObject())
         .isInstanceOf(PoolTimeoutException.class)
         .hasMessageContaining("Timed out");
@@ -256,7 +249,6 @@ class SimpleObjectPoolTest {
     awaitUntil("idle object to be evicted", AWAIT, () -> localPool.currentPoolSize() == 0);
     verify(factory).destroyObject(entity);
 
-    // Borrow again must create a new object
     TestPoolObject newBorrowed = localPool.borrowObject();
     assertThat(newBorrowed).isSameAs(second).isNotSameAs(borrowed);
   }
@@ -269,7 +261,7 @@ class SimpleObjectPoolTest {
     TestPoolObject borrowed = pool.borrowObject();
     pool.close();
 
-    // v3: close() is graceful, a borrowed object is destroyed when it is returned
+    // close() is graceful: the borrowed object is destroyed only when it is returned
     verify(factory, never()).destroyObject(any());
     assertThat(pool.isClosed()).isTrue();
     assertThatThrownBy(() -> pool.borrowObject()).isInstanceOf(PoolClosedException.class);
@@ -320,12 +312,10 @@ class SimpleObjectPoolTest {
 
     when(factory.isObjectValid(entity)).thenReturn(false);
 
-    // v3: testOnReturn failure destroys the object immediately
     localPool.returnObject(borrowed);
     verify(factory, times(1)).destroyObject(entity);
     assertThat(localPool.idleObjectCount()).isEqualTo(0);
 
-    // Next borrow should create new object
     TestPoolObject newBorrowed = localPool.borrowObject();
     assertThat(newBorrowed).isSameAs(newEntity).isNotSameAs(borrowed);
   }
@@ -342,8 +332,6 @@ class SimpleObjectPoolTest {
     assertThat(pool.idleObjectCount()).isEqualTo(0);
     assertThat(pool.currentPoolSize()).isEqualTo(0);
   }
-
-  // The old testMinimumTimeoutEnforcement was deleted: v3 no longer clamps timeouts to a 10 ms minimum.
 
   @Test
   void testNullTimeout() {
@@ -422,7 +410,6 @@ class SimpleObjectPoolTest {
     var localPool = newPool(config, factory);
     when(factory.createObject()).thenAnswer(inv -> new TestPoolObject());
 
-    // v3: the constructor creates nothing
     verify(factory, never()).createObject();
     assertThat(localPool.currentPoolSize()).isEqualTo(0);
 
@@ -558,11 +545,11 @@ class SimpleObjectPoolTest {
     when(factory.isObjectValid(obj2)).thenReturn(false);
     lenient().when(factory.isObjectValid(obj1)).thenReturn(true);
 
-    var borrowed1 = localPool.borrowObject(); // Will be borrowed twice
-    var borrowed2 = localPool.borrowObject(); // Will be borrowed once
+    var borrowed1 = localPool.borrowObject();
+    var borrowed2 = localPool.borrowObject();
 
     localPool.returnObject(borrowed1);
-    // Borrow obj1 again to increase its usage count
+    // Raise obj1's borrow count above obj2's
     borrowed1 = localPool.borrowObject();
     localPool.returnObject(borrowed1);
     localPool.returnObject(borrowed2);
@@ -600,11 +587,11 @@ class SimpleObjectPoolTest {
     when(factory.isObjectValid(obj1)).thenReturn(false);
     lenient().when(factory.isObjectValid(obj2)).thenReturn(true);
 
-    var borrowed1 = localPool.borrowObject(); // Will be borrowed twice
-    var borrowed2 = localPool.borrowObject(); // Will be borrowed once
+    var borrowed1 = localPool.borrowObject();
+    var borrowed2 = localPool.borrowObject();
 
     localPool.returnObject(borrowed1);
-    // Borrow obj1 again to increase its usage count
+    // Raise obj1's borrow count above obj2's
     borrowed1 = localPool.borrowObject();
     localPool.returnObject(borrowed1);
     localPool.returnObject(borrowed2);
@@ -741,24 +728,21 @@ class SimpleObjectPoolTest {
                                        .build();
     var localPool = newPool(config, lf);
 
-    // v3: no prefill in the constructor, prepare() (or the first maintenance run) fills minPoolSize
+    // The constructor does not prefill; prepare() or the first maintenance run fills minPoolSize
     assertThat(lf.created.get()).isEqualTo(0);
     localPool.prepare();
     awaitUntil("minPoolSize filled", AWAIT, () -> localPool.idleObjectCount() >= 2);
 
-    // Borrow and return to make it idle
     localPool.returnObject(localPool.borrowObject());
 
     // Eviction runs activate -> isObjectValid -> passivate on idle objects
     awaitUntil("eviction lifecycle calls", AWAIT, () -> lf.activated.get() > 0 && lf.validated.get() > 0 && lf.passivated.get() > 0);
     assertThat(lf.destroyed.get()).as("valid objects are not destroyed").isEqualTo(0);
 
-    // Activation failure during eviction destroys the object
     lf.failActivate = true;
     awaitUntil("object destroyed after activation failure", AWAIT, () -> lf.destroyed.get() > 0);
     lf.failActivate = false;
 
-    // Validation failure during eviction destroys the object, and the pool is topped up again
     int destroyedBefore = lf.destroyed.get();
     int createdBefore   = lf.created.get();
     lf.valid = false;
@@ -780,7 +764,6 @@ class SimpleObjectPoolTest {
 
     PooledObjectFactory<TestPoolObject> failingFactory = mock();
 
-    // First attempt throws, the retry succeeds
     when(failingFactory.createObject())
         .thenThrow(new RuntimeException("Simulated creation failure"))
         .thenReturn(new TestPoolObject());
@@ -947,17 +930,14 @@ class SimpleObjectPoolTest {
 
     var localPool = newPool(config, factory);
 
-    // 1. First borrow should succeed (newly created and activated)
     TestPoolObject obj1 = localPool.borrowObject();
     assertThat(obj1).isNotNull();
 
-    // 2. Return it to the pool so it becomes idle
     localPool.returnObject(obj1);
 
-    // 3. Force activation failure for the NEXT borrow (recycling obj1)
     doThrow(new RuntimeException("Activation Failed")).when(factory).activateObject(obj1);
 
-    // 4. Borrow should succeed: activation of idle obj1 fails -> obj1 destroyed -> a new object is created
+    // Activation of idle obj1 fails, obj1 is destroyed, and the borrow gets a newly created object
     TestPoolObject obj2 = localPool.borrowObject();
 
     assertThat(obj2).isNotNull().isNotSameAs(obj1);
@@ -980,15 +960,13 @@ class SimpleObjectPoolTest {
 
     var localPool = newPool(config, factory);
 
-    // 1. Borrow & Return (create idle)
     TestPoolObject obj1 = localPool.borrowObject();
     localPool.returnObject(obj1);
 
-    // 2. Fail activation and creation
     doThrow(new RuntimeException("Fatal Activation Error")).when(factory).activateObject(any());
     doThrow(new IllegalStateException("Create also failed")).when(factory).createObject();
 
-    // 3. Idle obj1 fails activation and is destroyed; the single creation attempt fails and its exception propagates unchanged
+    // Idle obj1 fails activation and is destroyed; the single creation attempt fails and its exception propagates unchanged
     assertThatThrownBy(localPool::borrowObject)
         .isInstanceOf(IllegalStateException.class)
         .hasMessage("Create also failed");

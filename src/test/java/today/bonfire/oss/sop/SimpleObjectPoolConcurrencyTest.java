@@ -27,7 +27,7 @@ class SimpleObjectPoolConcurrencyTest {
   @Test
   void testConcurrentBorrowAndReturn() throws Exception {
     var factory = new TestPooledObjectFactory();
-    // Generous wait: every thread must eventually get an object (the old test tolerated timeouts).
+    // Generous wait: every thread must eventually get an object.
     var config = SimpleObjectPoolConfig.builder()
                                        .maxPoolSize(MAX_POOL_SIZE)
                                        .waitingForObjectTimeout(Duration.ofSeconds(20))
@@ -97,7 +97,6 @@ class SimpleObjectPoolConcurrencyTest {
         f.get(10, TimeUnit.SECONDS);
       }
 
-      // v3: exactly one return wins, the other is rejected, and the object is idle exactly once.
       assertThat(succeeded.get()).isEqualTo(1);
       assertThat(rejected.get()).isEqualTo(1);
       assertThat(pool.idleObjectCount()).isEqualTo(1);
@@ -108,7 +107,7 @@ class SimpleObjectPoolConcurrencyTest {
   @Test
   void testConcurrentBorrowGetsDistinctObjects() throws Exception {
     var factory = new TestPooledObjectFactory();
-    factory.setCreationDelayMillis(100); // simulated slow creation
+    factory.setCreationDelayMillis(100);
     try (var pool = new SimpleObjectPool<>(SimpleObjectPoolConfig.builder()
                                                                  .maxPoolSize(MAX_POOL_SIZE)
                                                                  .testOnBorrow(true)
