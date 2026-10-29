@@ -9,6 +9,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.Isolated;
 import org.slf4j.LoggerFactory;
 import today.bonfire.oss.sop.SimpleObjectPoolConfig.EvictionPolicy;
 
@@ -20,6 +21,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Runs alone: it captures the shared {@code SimpleObjectPoolConfig} logger and asserts on what
+ * was logged, and other test classes building configs at the same time would pollute that.
+ */
+@Isolated
 @Timeout(30)
 class SimpleObjectPoolConfigTest {
 
