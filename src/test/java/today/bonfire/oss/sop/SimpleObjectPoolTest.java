@@ -52,6 +52,8 @@ class SimpleObjectPoolTest {
   @BeforeEach
   void setUp() {
     factory = mock();
+    // Every borrow, including a fresh object's first, runs the borrow test; objects pass unless a test says otherwise.
+    lenient().when(factory.isObjectValidForBorrow(any())).thenReturn(true);
     // Default eviction interval (5 min) keeps the scheduled maintenance out of the way of these tests.
     pool = newPool(SimpleObjectPoolConfig.builder()
                                          .maxPoolSize(MAX_POOL_SIZE)
@@ -172,8 +174,10 @@ class SimpleObjectPoolTest {
     TestPoolObject borrowed = pool.borrowObject();
     assertThat(borrowed).isSameAs(entity);
     verify(factory, times(1)).createObject();
-    // v3: freshly created objects are not validated on borrow (testOnCreate covers them)
-    verify(factory, never()).isObjectValidForBorrow(any());
+    // A freshly created object is activated and then tested on borrow, like an idle one.
+    var order = inOrder(factory);
+    order.verify(factory).activateObject(entity);
+    order.verify(factory).isObjectValidForBorrow(entity);
   }
 
   @Test
@@ -185,15 +189,16 @@ class SimpleObjectPoolTest {
     TestPoolObject borrowed = pool.borrowObject();
     pool.returnObject(borrowed);
 
-    // v3: no validation for the fresh object, only when it is recycled
-    verify(factory, never()).isObjectValidForBorrow(entity);
+    // The fresh object was tested on its first borrow
+    verify(factory, times(1)).isObjectValidForBorrow(entity);
 
     TestPoolObject borrowedAgain = pool.borrowObject();
     assertThat(borrowedAgain)
         .as("Should get the same object back")
         .isSameAs(entity);
     verify(factory, times(1)).createObject();
-    verify(factory, times(1)).isObjectValidForBorrow(entity);
+    verify(factory, times(2)).activateObject(entity);
+    verify(factory, times(2)).isObjectValidForBorrow(entity);
   }
 
   @Test
@@ -371,18 +376,17 @@ class SimpleObjectPoolTest {
                                                   .testOnBorrow(true)
                                                   .build(), factory);
 
-    // Old test expected 1 + 3 validations of fresh objects; v3 only validates recycled idle objects on borrow.
-    assertThat(localPool.addObject()).isTrue();
-    factory.setFailValidationForBorrow(true);
+    var idle = localPool.borrowObject();
+    localPool.returnObject(idle);
+    idle.destroy(); // TestPooledObjectFactory reports destroyed objects as invalid
 
     var borrowed = localPool.borrowObject();
 
-    assertThat(factory.getValidationForBorrowFailCount().get())
-        .as("The idle object failed validation exactly once")
-        .isEqualTo(1);
+    assertThat(borrowed).as("the invalid idle object is replaced by a fresh one").isNotSameAs(idle);
     assertThat(borrowed.isDestroyed()).isFalse();
     assertThat(localPool.currentPoolSize()).isEqualTo(1);
     assertThat(localPool.numOfObjectsCreated()).isEqualTo(2);
+    assertThat(localPool.stats().destroyed()).isEqualTo(1);
   }
 
   @Test
@@ -949,7 +953,7 @@ class SimpleObjectPoolTest {
 
     var localPool = newPool(config, factory);
 
-    // 1. First borrow should succeed (newly created, no activation)
+    // 1. First borrow should succeed (newly created and activated)
     TestPoolObject obj1 = localPool.borrowObject();
     assertThat(obj1).isNotNull();
 
@@ -957,7 +961,7 @@ class SimpleObjectPoolTest {
     localPool.returnObject(obj1);
 
     // 3. Force activation failure for the NEXT borrow (recycling obj1)
-    doThrow(new RuntimeException("Activation Failed")).when(factory).activateObject(any());
+    doThrow(new RuntimeException("Activation Failed")).when(factory).activateObject(obj1);
 
     // 4. Borrow should succeed: activation of idle obj1 fails -> obj1 destroyed -> a new object is created
     TestPoolObject obj2 = localPool.borrowObject();
@@ -965,7 +969,8 @@ class SimpleObjectPoolTest {
     assertThat(obj2).isNotNull().isNotSameAs(obj1);
 
     verify(factory).destroyObject(obj1);
-    verify(factory).activateObject(any()); // Activation was attempted once (never for fresh objects)
+    verify(factory, times(2)).activateObject(obj1); // fresh borrow, then the failed recycle
+    verify(factory).activateObject(obj2);
     assertThat(localPool.currentPoolSize()).isEqualTo(1);
   }
 

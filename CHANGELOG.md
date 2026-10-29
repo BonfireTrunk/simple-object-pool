@@ -23,6 +23,11 @@ delete `PoolObject` from their classes.
 - **`maxRetries` defaults to 0.** A failing `createObject` reaches the borrower after one
   attempt, with the factory's exception unchanged. The old default allowed three attempts
   back to back.
+- **Every borrow activates, then tests.** An object created for a borrower now goes through
+  `activateObject` before the borrower gets it, and `activateObject` runs before
+  `isObjectValidForBorrow` instead of after. A new object that fails either step counts as a
+  failed creation and uses up a retry: an activation exception reaches the borrower unchanged,
+  a failed borrow test surfaces as `PoolObjectValidationException`.
 - **`close()` is graceful.** Idle objects are destroyed, threads waiting in `borrowObject()`
   wake up and throw `PoolClosedException`, and borrowed objects are destroyed when they come
   back. The old behaviour of destroying borrowed objects on the spot is now `forceClose()`.
@@ -113,6 +118,8 @@ Timing and configuration:
   before the failure.
 - `PooledObjectFactory.shouldEvict(T, PooledObject<T>)`, a per-object eviction hook. Use it to
   retire connections on a server-initiated handoff, for example.
+- `PooledObjectFactory.isBrokenBy(T, Throwable)` decides whether `use` and `apply` destroy the
+  object after the action throws. The default destroys it.
 - Default no-op implementations for `activateObject`, `passivateObject`,
   `isObjectValidForBorrow` and `isObjectValid`. A minimal factory is two methods.
 - `PoolStats stats()` snapshot record.

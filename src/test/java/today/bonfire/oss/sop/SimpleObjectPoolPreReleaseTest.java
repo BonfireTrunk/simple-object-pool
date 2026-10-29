@@ -275,6 +275,7 @@ class SimpleObjectPoolPreReleaseTest {
     var creating = new CountDownLatch(1);
     var returned = new CountDownLatch(1);
     var attempts = new AtomicInteger();
+    var rejectAll = new AtomicBoolean();
     var factory = new SimpleObjectPoolRaceAndGuardTest.ControlFactory() {
       @Override
       public TestPoolObject createObject() {
@@ -287,7 +288,7 @@ class SimpleObjectPoolPreReleaseTest {
 
       @Override
       public boolean isObjectValidForBorrow(TestPoolObject obj) {
-        return false;
+        return !rejectAll.get();
       }
     };
     try (var pool = new SimpleObjectPool<>(config(2).maxRetries(1).testOnBorrow(true).build(), factory)) {
@@ -295,6 +296,7 @@ class SimpleObjectPoolPreReleaseTest {
       var            thrown   = new AtomicReference<Throwable>();
       Thread         borrower =Thread.ofVirtual().start(() -> run(() -> pool.borrowObject(Duration.ofMillis(30)), thrown));
       assertThat(creating.await(5, TimeUnit.SECONDS)).isTrue();
+      rejectAll.set(true);
       pool.returnObject(held); // idle while the creation fails; the borrower polls it and it fails validation
       returned.countDown();
       borrower.join(5000);

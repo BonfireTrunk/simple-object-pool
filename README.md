@@ -88,8 +88,9 @@ try (var pool = new SimpleObjectPool<>(config, new ConnectionFactory())) {
 }
 ```
 
-If the action you pass to `use` or `apply` throws, the object is returned as broken and
-destroyed, and your exception propagates unchanged.
+If the action you pass to `use` or `apply` throws, your exception propagates unchanged and the
+object is destroyed, unless your factory's `isBrokenBy` says the object survived that failure,
+for example an error reply that was read in full.
 
 When two pools share a config but need distinct names, use
 `new SimpleObjectPool<>("pool-name", config, factory)`.
@@ -118,7 +119,10 @@ round-robin if you would rather keep every object warm.
 
 **Validation.** `testOnCreate`, `testOnBorrow`, `testOnReturn` and `testWhileIdle` control when
 `isObjectValid` and `isObjectValidForBorrow` run. Anything that fails is destroyed and the
-borrower moves on to the next object. Only `testWhileIdle` is on by default.
+borrower moves on to the next object. Only `testWhileIdle` is on by default. Every borrow runs
+`activateObject` and then the borrow test, including the first borrow of an object created for
+that borrower. If a new object fails either step, that counts as a failed creation and uses up
+a retry.
 
 **Eviction.** Every `durationBetweenEvictionsRuns` the pool looks at its idle objects. An object
 goes if your factory's `shouldEvict` hook says so, if it has sat idle longer than
@@ -186,16 +190,18 @@ failure unchanged and leaves objects created before it in the pool.
 |---|---|---|
 | `createObject()` | yes | When a borrower needs an object and capacity is free, or by `prepare` / `addObjects` / maintenance |
 | `destroyObject(T)` | yes | Exactly once per object, on eviction, invalidation, abandonment or close |
-| `activateObject(T)` | no | Before an idle object is handed to a borrower, and before idle validation |
+| `activateObject(T)` | no | On every borrow, before the borrow test, and before idle validation |
 | `passivateObject(T)` | no | After return, before the object goes idle, and after idle validation |
-| `isObjectValidForBorrow(T)` | no | On borrow when `testOnBorrow` is on; keep it cheap |
+| `isObjectValidForBorrow(T)` | no | On every borrow after `activateObject`, when `testOnBorrow` is on; keep it cheap |
 | `isObjectValid(T)` | no | On create, return and idle tests, per the `testOn*` flags |
 | `shouldEvict(T, PooledObject<T>)` | no | For each idle object an eviction run examines; return true to evict it |
+| `isBrokenBy(T, Throwable)` | no | When the action given to `use` or `apply` throws; return false to keep the object |
 
-An exception from `createObject` reaches the borrower unchanged once retries are exhausted.
-Exceptions from the other methods mark the object invalid; it is destroyed and the borrower
-moves on. If a factory method throws an `Error`, the pool still cleans up its own state before
-rethrowing anything fatal, so a `NoClassDefFoundError` cannot leak a capacity slot.
+An exception from `createObject`, or from `activateObject` on an object just created for the
+borrower, reaches the borrower unchanged once retries are exhausted. Exceptions from the other
+methods mark the object invalid; it is destroyed and the borrower moves on. If a factory method
+throws an `Error`, the pool still cleans up its own state before rethrowing anything fatal, so
+a `NoClassDefFoundError` cannot leak a capacity slot.
 
 A factory method that can block, for example a network ping, should carry its own timeout.
 The pool does not interrupt factory calls.
@@ -222,9 +228,10 @@ All pool exceptions are unchecked and extend `PoolException`.
 | `PoolInterruptedException` | A borrow was interrupted; the interrupt flag is restored |
 | `PoolClosedException` | Borrow on a closed pool, or the pool closed while you were waiting |
 | `PoolObjectException` | Returning null, or an object that was never borrowed from this pool |
-| `PoolObjectValidationException` | A newly created object failed `testOnCreate` validation |
+| `PoolObjectValidationException` | A newly created object failed `testOnCreate` or `testOnBorrow` validation on every attempt |
 
-Factory exceptions from `createObject` are not wrapped. You get exactly what the factory threw.
+Factory exceptions from `createObject`, and from activating a newly created object, are not
+wrapped. You get exactly what the factory threw.
 
 ## Upgrading from 2.x
 
@@ -236,6 +243,8 @@ is in [CHANGELOG.md](CHANGELOG.md). The short version:
 - Abandon detection is off unless you set `abandonedTimeout`.
 - The constructor no longer prefills. Call `prepare()` if you relied on that.
 - `maxRetries` defaults to 0, so a creation failure surfaces after one attempt.
+- New objects are activated before their first borrow, and `activateObject` runs before
+  `isObjectValidForBorrow` on every borrow.
 - Config time getters return `Duration`.
 - `close()` no longer destroys borrowed objects. Use `forceClose()` for the old behaviour.
 - Returning an object that is not borrowed throws instead of logging.

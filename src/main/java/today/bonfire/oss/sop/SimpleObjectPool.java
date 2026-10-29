@@ -285,11 +285,13 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    *
    * @return a pooled object, never null
    *
-   * @throws PoolTimeoutException     if no object became available in time; if creation failed during
-   *                                  the wait, the last creation exception is the cause
-   * @throws PoolClosedException      if the pool is closed, or is closed while waiting
-   * @throws PoolInterruptedException if the thread is interrupted; the interrupt flag is restored
-   * @throws RuntimeException         whatever the factory threw from {@code createObject()} once retries are exhausted
+   * @throws PoolTimeoutException          if no object became available in time; if creation failed during
+   *                                       the wait, the last creation exception is the cause
+   * @throws PoolClosedException           if the pool is closed, or is closed while waiting
+   * @throws PoolInterruptedException      if the thread is interrupted; the interrupt flag is restored
+   * @throws PoolObjectValidationException if a newly created object failed validation and retries are exhausted
+   * @throws RuntimeException              whatever the factory threw from {@code createObject()} or from
+   *                                       activating the new object, once retries are exhausted
    */
   public T borrowObject() throws PoolException {
     return borrowObject(config.waitingForObjectTimeout());
@@ -353,7 +355,9 @@ public class SimpleObjectPool<T> implements AutoCloseable {
           if (reserveSlot()) {
             boolean created = false;
             try {
-              p       = create();
+              PooledObject<T> candidate = create();
+              prepareCreatedForBorrow(candidate);
+              p       = candidate;
               created = true;
               fresh   = true;
             } catch (RuntimeException e) {
@@ -420,7 +424,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   }
 
   /**
-   * Validates (if configured) and activates an idle object the caller now owns. On any failure
+   * Activates and, if configured, validates an idle object the caller now owns. On any failure
    * the object is destroyed and false is returned; fatal errors are rethrown after cleanup.
    */
   private boolean prepareForBorrow(PooledObject<T> p) {
@@ -428,15 +432,15 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     boolean   valid   = false;
     Throwable failure = null;
     try {
+      factory.activateObject(object);
       valid = !config.testOnBorrow() || factory.isObjectValidForBorrow(object);
-      if (valid) factory.activateObject(object);
     } catch (Throwable t) {
       failure = t;
     }
     if (failure != null) {
-      destroy(p, "validation or activation on borrow threw");
+      destroy(p, "activation or validation on borrow threw");
       rethrowIfFatal(failure);
-      log.warn("Pool {}: validation or activation of object {} threw, destroyed it", name, p.id(), failure);
+      log.warn("Pool {}: activation or validation of object {} threw, destroyed it", name, p.id(), failure);
       return false;
     }
     if (!valid) {
@@ -617,8 +621,9 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   }
 
   /**
-   * Borrows an object, runs the action, and returns the object. If the action throws, the object
-   * is returned as broken and the exception propagates.
+   * Borrows an object, runs the action, and returns the object. If the action throws, the
+   * exception propagates and the object is destroyed unless
+   * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable.
    */
   public void use(Consumer<? super T> action) throws PoolException {
     apply(obj -> {
@@ -629,8 +634,9 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /**
    * Borrows an object, applies the function, returns the object, and yields the result. If the
-   * function throws, the object is returned as broken and the function's exception propagates;
-   * any exception from the return is attached to it as suppressed.
+   * function throws, the function's exception propagates and the object is destroyed unless
+   * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable. Any
+   * exception from that hook or from the return is attached to the function's as suppressed.
    */
   public <R> R apply(Function<? super T, ? extends R> function) throws PoolException {
     T obj = borrowObject();
@@ -638,15 +644,31 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     try {
       result = function.apply(obj);
     } catch (Throwable t) {
-      try {
-        returnObject(obj, true);
-      } catch (RuntimeException returnFailure) {
-        t.addSuppressed(returnFailure);
-      }
+      returnAfterFailure(obj, t);
       throw t;
     }
     returnObject(obj, false);
     return result;
+  }
+
+  /** Returns an object whose action threw {@code failure}, asking the factory whether it is broken. */
+  private void returnAfterFailure(T obj, Throwable failure) {
+    boolean   broken      = true; // unknown state: the safe answer if the hook itself fails
+    Throwable hookFailure = null;
+    try {
+      broken = factory.isBrokenBy(obj, failure);
+    } catch (Throwable t) {
+      hookFailure = t;
+    }
+    try {
+      returnObject(obj, broken);
+    } catch (RuntimeException returnFailure) {
+      failure.addSuppressed(returnFailure);
+    }
+    if (hookFailure != null && hookFailure != failure) {
+      rethrowIfFatal(hookFailure);
+      failure.addSuppressed(hookFailure);
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -698,6 +720,36 @@ public class SimpleObjectPool<T> implements AutoCloseable {
       log.trace("Pool {}: created object {} (total={})", name, p.id(), total.get());
     }
     return p;
+  }
+
+  /**
+   * Activates and, if configured, validates an object created for the borrower that will get it.
+   * A failure is a creation failure: the object is destroyed and an activation exception
+   * propagates unchanged. The caller must release the slot if this throws.
+   */
+  private void prepareCreatedForBorrow(PooledObject<T> p) {
+    T object = p.object();
+    try {
+      factory.activateObject(object);
+    } catch (Throwable t) {
+      destroyQuietly(p);
+      throw t;
+    }
+    if (!config.testOnBorrow()) {
+      return;
+    }
+    boolean valid;
+    try {
+      valid = factory.isObjectValidForBorrow(object);
+    } catch (Throwable t) {
+      destroyQuietly(p);
+      rethrowIfFatal(t);
+      throw new PoolObjectValidationException("Borrow validation of a newly created object threw in pool " + name, t);
+    }
+    if (!valid) {
+      destroyQuietly(p);
+      throw new PoolObjectValidationException("Newly created object failed borrow validation in pool " + name);
+    }
   }
 
   /** Destroys an object that owns a slot and releases that slot, whatever the factory does. */

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Timeout;
 import today.bonfire.oss.sop.exceptions.PoolClosedException;
 import today.bonfire.oss.sop.exceptions.PoolException;
 import today.bonfire.oss.sop.exceptions.PoolObjectException;
+import today.bonfire.oss.sop.exceptions.PoolObjectValidationException;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicReference;
@@ -95,17 +96,18 @@ class SimpleObjectPoolEdgeCaseTest {
 
       factory.setFailValidationForBorrow(true);
 
-      // v3: validation on borrow applies to idle objects only. The invalid idle object is destroyed
-      // and a fresh one (not re-validated) is handed out, so the borrow succeeds.
-      TestPoolObject next = pool.borrowObject();
+      // The invalid idle object is destroyed, and every fresh replacement fails the same borrow
+      // test, which counts as a failed creation until retries are exhausted.
+      assertThatThrownBy(pool::borrowObject).isInstanceOf(PoolObjectValidationException.class);
 
       assertThat(factory.getValidationForBorrowFailCount().get())
-          .as("Only the single idle object is validated")
-          .isEqualTo(1);
+          .as("The idle object plus one fresh object per creation attempt")
+          .isEqualTo(1 + 3);
       assertThat(borrowed.isDestroyed()).isTrue();
-      assertThat(next).isNotSameAs(borrowed);
-      assertThat(pool.currentPoolSize()).isEqualTo(1);
-      pool.returnObject(next);
+      assertThat(pool.currentPoolSize()).isZero();
+
+      factory.setFailValidationForBorrow(false);
+      pool.returnObject(pool.borrowObject());
     }
   }
 

@@ -18,7 +18,8 @@ public interface PooledObjectFactory<T> {
   /**
    * Creates a new object. Called with no pool lock held. Any exception thrown propagates
    * unchanged to the caller of {@link SimpleObjectPool#borrowObject()} once creation
-   * retries are exhausted.
+   * retries are exhausted. The new object is treated like an idle one: it goes through
+   * {@link #activateObject(Object)} and, if configured, the borrow test before any borrower gets it.
    *
    * @return a new object, never null
    */
@@ -33,9 +34,11 @@ public interface PooledObjectFactory<T> {
   void destroyObject(T obj);
 
   /**
-   * Prepares an object that is about to be handed to a borrower. Called on every borrow of an
-   * existing idle object, and before each validation during an idle test. An exception marks
-   * the object invalid and it is destroyed.
+   * Prepares an object that is about to be handed to a borrower. Called on every borrow, including
+   * the first borrow of a newly created object, before the borrow test, and before each validation
+   * during an idle test. An exception marks the object invalid and it is destroyed. On a newly
+   * created object the failure counts as a creation failure, and once retries are exhausted the
+   * borrower gets the exception unchanged.
    *
    * @param obj the object to activate
    */
@@ -52,9 +55,11 @@ public interface PooledObjectFactory<T> {
   }
 
   /**
-   * A cheap check run on borrow when {@link SimpleObjectPoolConfig#testOnBorrow()} is on.
-   * Returning false destroys the object and the borrower tries the next one.
-   * Keep this fast; put expensive checks in {@link #isObjectValid(Object)}.
+   * A cheap check run on every borrow, after {@link #activateObject(Object)}, when
+   * {@link SimpleObjectPoolConfig#testOnBorrow()} is on. Returning false destroys the object and
+   * the borrower tries the next one. On a newly created object the failure counts as a creation
+   * failure and surfaces as {@link today.bonfire.oss.sop.exceptions.PoolObjectValidationException}
+   * once retries are exhausted. Keep this fast; put expensive checks in {@link #isObjectValid(Object)}.
    *
    * @param obj the object to check
    * @return true if the object may be borrowed
@@ -86,5 +91,22 @@ public interface PooledObjectFactory<T> {
    */
   default boolean shouldEvict(T obj, PooledObject<T> info) {
     return false;
+  }
+
+  /**
+   * Decides whether an object is still usable after the action passed to
+   * {@link SimpleObjectPool#use} or {@link SimpleObjectPool#apply} threw. Returning true destroys
+   * the object; false returns it to the pool like a normal return, including {@code testOnReturn}
+   * and {@link #passivateObject(Object)}. The default returns true because the pool cannot know
+   * what state the action left the object in. Override it to keep objects through failures that
+   * leave them intact, for example an error reply that was read in full. If this method throws,
+   * the object is destroyed. Leases and direct {@code returnObject} calls do not consult it.
+   *
+   * @param obj   the object the action was using
+   * @param error what the action threw
+   * @return true to destroy the object, false to return it to the pool
+   */
+  default boolean isBrokenBy(T obj, Throwable error) {
+    return true;
   }
 }

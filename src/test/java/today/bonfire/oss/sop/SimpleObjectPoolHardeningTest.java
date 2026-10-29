@@ -167,11 +167,12 @@ class SimpleObjectPoolHardeningTest {
   @Test
   void errorFromActivateOrPassivateDestroysObjectAndFreesSlot() throws Exception {
     var factory = new GatedFactory() {
-      volatile boolean failActivate, failPassivate;
+      volatile boolean        failPassivate;
+      volatile TestPoolObject failActivate;
 
       @Override
       public void activateObject(TestPoolObject obj) {
-        if (failActivate) throw new AssertionError("activate");
+        if (obj == failActivate) throw new AssertionError("activate");
       }
 
       @Override
@@ -189,12 +190,12 @@ class SimpleObjectPoolHardeningTest {
 
       TestPoolObject second = pool.borrowObject();
       pool.returnObject(second);
-      factory.failActivate = true;
+      factory.failActivate = second;
       TestPoolObject third = pool.borrowObject(); // idle object fails activation with an Error, a fresh one is created
       assertThat(third).isNotSameAs(second);
       assertThat(second.isDestroyed()).isTrue();
       assertThat(pool.currentPoolSize()).isEqualTo(1);
-      factory.failActivate = false;
+      factory.failActivate = null;
       pool.returnObject(third);
     }
   }
