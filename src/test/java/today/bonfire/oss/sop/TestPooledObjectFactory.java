@@ -158,7 +158,7 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObje
       return false;
     }
 
-    return obj != null && obj.getEntityId() != null;
+    return obj != null && obj.isValid();
   }
 
   @Override
