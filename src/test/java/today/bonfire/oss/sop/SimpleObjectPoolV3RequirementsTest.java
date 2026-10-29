@@ -56,7 +56,6 @@ class SimpleObjectPoolV3RequirementsTest {
                                  .testWhileIdle(false);
   }
 
-  // 1. R1: long holds are never reclaimed
   @Test
   void borrowedObjectIsNeverDestroyedWhileHeldByDefault() {
     var factory = new CountingFactory();
@@ -75,7 +74,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 2. R2: close wakes parked borrowers, nothing is created after close
   @Test
   void closeWakesParkedBorrowerAndPreventsCreation() throws Exception {
     var factory = new CountingFactory();
@@ -110,7 +108,6 @@ class SimpleObjectPoolV3RequirementsTest {
     waiter.join();
   }
 
-  // 3. R3: close is graceful for borrowed objects
   @Test
   void closeDoesNotDestroyBorrowedObjectUntilReturned() {
     var factory = new CountingFactory();
@@ -133,7 +130,6 @@ class SimpleObjectPoolV3RequirementsTest {
     assertThat(pool.borrowedObjectsCount()).isZero();
   }
 
-  // 4. R4: slow creation does not block return or borrow of other objects
   @Test
   void slowCreateDoesNotBlockOtherBorrowersAndReturners() throws Exception {
     var gate      = new CountDownLatch(1);
@@ -182,7 +178,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 5. R4: an object under idle test is invisible to borrowers
   @Test
   void borrowerNeverReceivesObjectUnderIdleTest() throws Exception {
     var gate      = new CountDownLatch(1);
@@ -222,7 +217,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 6. R5: a single create attempt, exception instance propagated unchanged
   @Test
   void createFailurePropagatesSameInstanceAfterOneAttempt() {
     var boom    = new IllegalStateException("boom");
@@ -241,7 +235,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 7. R6: passivate failure destroys and frees the slot for a waiter
   @Test
   void passivateFailureDestroysObjectAndFreesSlot() throws Exception {
     var factory = new CountingFactory() {
@@ -261,7 +254,7 @@ class SimpleObjectPoolV3RequirementsTest {
     });
     awaitUntil("waiter parked", WAIT, () -> pool.waitingCount() == 1);
 
-    pool.returnObject(held); // must not throw, must destroy
+    pool.returnObject(held);
     assertThat(held.isDestroyed()).isTrue();
     assertThat(factory.destroys.get()).isEqualTo(1);
     assertThat(done.await(5, TimeUnit.SECONDS)).as("waiter served with a new object").isTrue();
@@ -272,7 +265,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 8. R7: evict() validates everything even with policy NONE
   @Test
   void manualEvictValidatesAllIdleObjectsWithPolicyNone() {
     var validated = new AtomicInteger();
@@ -300,7 +292,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 9. R8: shared daemon scheduler
   @Test
   void manyPoolsDoNotMultiplyPlatformThreads() {
     long before = platformThreadCount();
@@ -335,7 +326,6 @@ class SimpleObjectPoolV3RequirementsTest {
     return Thread.getAllStackTraces().keySet().stream().filter(t -> !t.isVirtual()).count();
   }
 
-  // 10. S1: cross-pool return is rejected
   @Test
   void returningForeignObjectIsRejectedWithoutCorruptingPool() {
     var factoryA = new CountingFactory();
@@ -361,7 +351,6 @@ class SimpleObjectPoolV3RequirementsTest {
     poolB.close();
   }
 
-  // 11. LIFO by default, FIFO on request
   @Test
   void idleOrderIsLifoByDefaultAndFifoWhenConfigured() {
     var lifo = new SimpleObjectPool<>(cfg(2).build(), new CountingFactory());
@@ -381,7 +370,6 @@ class SimpleObjectPoolV3RequirementsTest {
     fifo.close();
   }
 
-  // 12. forceClose destroys borrowed objects, close does not
   @Test
   void forceCloseDestroysBorrowedObjectsImmediately() {
     var factory = new CountingFactory();
@@ -402,7 +390,6 @@ class SimpleObjectPoolV3RequirementsTest {
     assertThat(held2.isDestroyed()).isTrue();
   }
 
-  // 13. waitingCount reflects parked borrowers
   @Test
   void waitingCountTracksParkedBorrowers() throws Exception {
     var pool = new SimpleObjectPool<>(cfg(1).build(), new CountingFactory());
@@ -423,7 +410,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 14. Lease
   @Test
   void leaseReturnsOnCloseAndMarkBrokenDestroys() {
     var factory = new CountingFactory();
@@ -447,7 +433,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 15. apply() marks broken on exception
   @Test
   void applyReturnsObjectAsBrokenWhenFunctionThrows() {
     var factory = new CountingFactory();
@@ -469,7 +454,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 16. return to a closed pool destroys and size reaches zero
   @Test
   void returnToClosedPoolDestroysObject() {
     var factory = new CountingFactory();
@@ -487,7 +471,6 @@ class SimpleObjectPoolV3RequirementsTest {
     assertThat(pool.idleObjectCount()).isZero();
   }
 
-  // 17. shouldEvict hook overrides idle time and minPoolSize
   @Test
   void shouldEvictHookEvictsYoungObjectEvenAtMinPoolSize() {
     var retired = new AtomicReference<TestPoolObject>();
@@ -515,7 +498,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 18. zero wait fails fast
   @Test
   void zeroWaitFailsImmediatelyWhenExhausted() {
     var pool = new SimpleObjectPool<>(cfg(1).build(), new CountingFactory());
@@ -528,7 +510,6 @@ class SimpleObjectPoolV3RequirementsTest {
     pool.close();
   }
 
-  // 19. retries
   @Test
   void retriesHonourMaxRetriesAndDefaultIsSingleAttempt() {
     var attempts = new AtomicInteger();

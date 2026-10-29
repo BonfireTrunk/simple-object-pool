@@ -431,7 +431,6 @@ class SimpleObjectPoolConfigTest {
 
   @Test
   void noWarn_evictionRunShorterOrLongerThanWaitTimeout() {
-    // the old "durationBetweenEvictionsRuns <= waitingForObjectTimeout" warning no longer exists
     SimpleObjectPoolConfig.builder().durationBetweenEvictionsRuns(Duration.ofSeconds(1))
                           .waitingForObjectTimeout(Duration.ofSeconds(30)).build();
     assertThat(allMessages()).isEmpty();

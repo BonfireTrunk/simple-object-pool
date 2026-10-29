@@ -66,7 +66,6 @@ class SimpleObjectPoolHardeningTest {
       var evictor = Thread.ofVirtual().start(pool::evict);
       awaitUntil("evictor removed the object from idle for testing", AWAIT, () -> pool.idleObjectCount() == 0 && pool.currentPoolSize() == 1);
 
-      // clear() while the only object is being validated
       pool.destroyAllIdleObjects();
       assertThat(pool.currentPoolSize()).as("object under test still counted until the test finishes").isEqualTo(1);
 
@@ -121,7 +120,7 @@ class SimpleObjectPoolHardeningTest {
       TestPoolObject a = pool.borrowObject();
       TestPoolObject b = pool.borrowObject();
       TestPoolObject c = pool.borrowObject();
-      // 3 borrowed, 2 idle, total 5. Old rule (total > minPoolSize) evicted both idle objects and recreated them.
+      // 3 borrowed, 2 idle: eviction compares the idle count with minPoolSize, not the total.
       pool.evict();
       assertThat(factory.destroyed.get()).as("idle count equals minPoolSize, nothing to evict").isZero();
       assertThat(pool.idleObjectCount()).isEqualTo(2);
@@ -167,11 +166,12 @@ class SimpleObjectPoolHardeningTest {
   @Test
   void errorFromActivateOrPassivateDestroysObjectAndFreesSlot() throws Exception {
     var factory = new GatedFactory() {
-      volatile boolean failActivate, failPassivate;
+      volatile boolean        failPassivate;
+      volatile TestPoolObject failActivate;
 
       @Override
       public void activateObject(TestPoolObject obj) {
-        if (failActivate) throw new AssertionError("activate");
+        if (obj == failActivate) throw new AssertionError("activate");
       }
 
       @Override
@@ -189,12 +189,12 @@ class SimpleObjectPoolHardeningTest {
 
       TestPoolObject second = pool.borrowObject();
       pool.returnObject(second);
-      factory.failActivate = true;
+      factory.failActivate = second;
       TestPoolObject third = pool.borrowObject(); // idle object fails activation with an Error, a fresh one is created
       assertThat(third).isNotSameAs(second);
       assertThat(second.isDestroyed()).isTrue();
       assertThat(pool.currentPoolSize()).isEqualTo(1);
-      factory.failActivate = false;
+      factory.failActivate = null;
       pool.returnObject(third);
     }
   }

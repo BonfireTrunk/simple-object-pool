@@ -1,5 +1,5 @@
 /**
- * A lightweight, dependency-free object pool for Java 21+.
+ * A lightweight object pool for Java 21+. Its only dependency is SLF4J.
  */
 module bonfire.oss.sop {
   requires org.slf4j;

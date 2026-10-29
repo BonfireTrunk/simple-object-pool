@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import today.bonfire.oss.sop.exceptions.PoolClosedException;
 import today.bonfire.oss.sop.exceptions.PoolException;
+import today.bonfire.oss.sop.exceptions.PoolInterruptedException;
 import today.bonfire.oss.sop.exceptions.PoolObjectException;
 import today.bonfire.oss.sop.exceptions.PoolObjectValidationException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
@@ -28,7 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAccumulator;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -71,18 +72,10 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   private static final Logger log = LoggerFactory.getLogger(SimpleObjectPool.class);
 
-  /** One daemon thread ticks every pool's maintenance. The work itself runs on virtual threads. */
-  private static final ScheduledExecutorService SCHEDULER;
-
-  static {
-    ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, r -> {
-      Thread t = new Thread(r, "sop-maintenance");
-      t.setDaemon(true);
-      return t;
-    });
-    executor.setRemoveOnCancelPolicy(true);
-    SCHEDULER = executor;
-  }
+  /** One daemon thread ticks every registered pool's maintenance. The work itself runs on virtual threads. */
+  private static final ReentrantLock           SCHEDULER_LOCK = new ReentrantLock();
+  private static       ScheduledExecutorService scheduler;
+  private static       int                      registeredPools;
 
   private final SimpleObjectPoolConfig config;
   private final PooledObjectFactory<T> factory;
@@ -90,6 +83,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   private final int                    maxPoolSize;
   private final boolean                lifo;
   private final long                   evictionTimeoutNanos;
+  private final ClassLoader            maintenanceContextClassLoader;
 
   private final ConcurrentLinkedDeque<PooledObject<T>>          idle     = new ConcurrentLinkedDeque<>();
   private final ConcurrentHashMap<IdentityKey, PooledObject<T>> borrowed = new ConcurrentHashMap<>();
@@ -112,66 +106,172 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   private final ReentrantLock evictionLock        = new ReentrantLock();
   private final AtomicBoolean maintenanceRunning  = new AtomicBoolean();
   private final AtomicBoolean abandonCheckRunning = new AtomicBoolean();
-  /** Bumped by destroyAllIdleObjects so an object under idle test at that moment is destroyed instead of restored. */
-  private final AtomicLong    clearEpoch          = new AtomicLong();
+  /** Track clears overlapping an idle test, including a clear whose drain has already started. */
+  private final AtomicLong    clearsStarted       = new AtomicLong();
+  private final AtomicLong    clearsFinished      = new AtomicLong();
 
   private final AtomicLong idSequence     = new AtomicLong();
   private final AtomicLong destroyedCount = new AtomicLong();
   /** Written on every borrow, read only by stats, so a striped adder beats a single CAS line. */
-  private final LongAdder  borrowCount    = new LongAdder();
+  private final LongAdder       borrowCount    = new LongAdder();
+  private final LongAdder       waitCount      = new LongAdder();
+  private final LongAdder       totalWaitNanos = new LongAdder();
+  private final LongAccumulator maxWaitNanos   = new LongAccumulator(Long::max, 0);
 
-  private volatile boolean            closed;
-  private final    AtomicBoolean      closeStarted = new AtomicBoolean();
-  private final    ScheduledFuture<?> maintenanceTask;
-  private final    ScheduledFuture<?> abandonTask;
+  private volatile boolean               closed;
+  private final    AtomicBoolean         closeStarted = new AtomicBoolean();
+  private final    SchedulerRegistration schedulerRegistration;
 
   public SimpleObjectPool(SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
-    this.config               = Objects.requireNonNull(config, "config");
-    this.factory              = Objects.requireNonNull(factory, "factory");
-    this.name                 = config.poolName();
-    this.maxPoolSize          = config.maxPoolSize();
-    this.lifo                 = config.lifo();
-    this.evictionTimeoutNanos = Math.max(0, saturatedNanos(config.objEvictionTimeout()));
-    this.waitLock             = new ReentrantLock(config.fairness());
-    this.available            = waitLock.newCondition();
+    this(Objects.requireNonNull(config, "config").poolName(), config, factory);
+  }
 
-    boolean needsMaintenance = config.evictionPolicy() != SimpleObjectPoolConfig.EvictionPolicy.NONE || config.minPoolSize() > 0;
-    maintenanceTask = needsMaintenance
-                      ? schedule(this, config.durationBetweenEvictionsRuns(), "maintenance", pool -> pool.runOnVirtualThread("maintenance", pool.maintenanceRunning, pool::scheduledMaintenance))
-                      : null;
-    abandonTask = config.abandonCheckEnabled()
-                  ? schedule(this, config.durationBetweenAbandonCheckRuns(), "abandon-check", pool -> pool.runOnVirtualThread("abandon-check", pool.abandonCheckRunning, pool::abandonCheckRun))
-                  : null;
-    log.info("Pool {} created: maxPoolSize={}, minPoolSize={}, lifo={}, abandonCheck={}", name, maxPoolSize, config.minPoolSize(), lifo, config.abandonCheckEnabled());
+  /**
+   * Creates a pool with its own name, allowing multiple pools to share a config.
+   *
+   * @param name the name used in logs, thread names and exceptions
+   * @param config the pool configuration
+   * @param factory the object lifecycle factory
+   * @throws IllegalArgumentException if the name is null or blank
+   */
+  public SimpleObjectPool(String name, SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
+    if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be null or blank");
+    this.config                        = Objects.requireNonNull(config, "config");
+    this.factory                       = Objects.requireNonNull(factory, "factory");
+    this.name                          = name;
+    this.maxPoolSize                   = config.maxPoolSize();
+    this.lifo                          = config.lifo();
+    this.evictionTimeoutNanos          = Math.max(0, saturatedNanos(config.objEvictionTimeout()));
+    this.maintenanceContextClassLoader = Thread.currentThread().getContextClassLoader();
+    this.waitLock                      = new ReentrantLock(config.fairness());
+    this.available                     = waitLock.newCondition();
+
+    boolean               needsMaintenance = config.evictionPolicy() != SimpleObjectPoolConfig.EvictionPolicy.NONE || config.minPoolSize() > 0;
+    SchedulerRegistration registration     = null;
+    SCHEDULER_LOCK.lock();
+    try {
+      if (needsMaintenance || config.abandonCheckEnabled()) {
+        registration = register(name);
+        if (needsMaintenance) {
+          registration.maintenanceTask = schedule(this, registration, config.durationBetweenEvictionsRuns(), "maintenance", pool -> pool.runOnVirtualThread("maintenance", pool.maintenanceRunning, pool::scheduledMaintenance));
+        }
+        if (config.abandonCheckEnabled()) {
+          registration.abandonTask = schedule(this, registration, config.durationBetweenAbandonCheckRuns(), "abandon-check", pool -> pool.runOnVirtualThread("abandon-check", pool.abandonCheckRunning, pool::abandonCheckRun));
+        }
+      }
+      this.schedulerRegistration = registration;
+      log.info("Pool {} created: maxPoolSize={}, minPoolSize={}, lifo={}, abandonCheck={}", name, maxPoolSize, config.minPoolSize(), lifo, config.abandonCheckEnabled());
+    } catch (Throwable t) {
+      if (registration != null) registration.release(false);
+      throw t;
+    } finally {
+      SCHEDULER_LOCK.unlock();
+    }
   }
 
   public SimpleObjectPool(PooledObjectFactory<T> factory) {
     this(SimpleObjectPoolConfig.defaultConfig(), factory);
   }
 
-  /**
-   * Schedules a periodic task that holds the pool only weakly, so a pool that is dropped without
-   * being closed can still be garbage collected; its task then cancels itself on the next tick.
-   */
-  private static <T> ScheduledFuture<?> schedule(SimpleObjectPool<T> pool, Duration period, String task, Consumer<SimpleObjectPool<T>> body) {
+  private static SchedulerRegistration register(String name) {
+    SCHEDULER_LOCK.lock();
+    try {
+      if (scheduler == null || scheduler.isShutdown()) {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, r -> {
+          Thread t = new Thread(r, "sop-maintenance");
+          t.setDaemon(true);
+          t.setContextClassLoader(SimpleObjectPool.class.getClassLoader());
+          return t;
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        scheduler = executor;
+      }
+      registeredPools++;
+      return new SchedulerRegistration(name, scheduler);
+    } finally {
+      SCHEDULER_LOCK.unlock();
+    }
+  }
+
+  /** For tests only: lets the scheduler lifecycle tests observe registrations. Not part of the API. */
+  static int schedulerRegistrationCount() {
+    SCHEDULER_LOCK.lock();
+    try {
+      return registeredPools;
+    } finally {
+      SCHEDULER_LOCK.unlock();
+    }
+  }
+
+  /** For tests only: lets the scheduler lifecycle tests observe shutdown and restart. Not part of the API. */
+  static ScheduledExecutorService maintenanceScheduler() {
+    SCHEDULER_LOCK.lock();
+    try {
+      return scheduler;
+    } finally {
+      SCHEDULER_LOCK.unlock();
+    }
+  }
+
+  /** Schedules a weak periodic task. Its registration contains no reference to the pool. */
+  private static <T> ScheduledFuture<?> schedule(SimpleObjectPool<T> pool, SchedulerRegistration registration, Duration period, String task, Consumer<SimpleObjectPool<T>> body) {
     long nanos = Math.max(1, saturatedNanos(period));
     var  ref   = new WeakReference<>(pool);
-    var  self  = new AtomicReference<ScheduledFuture<?>>();
-    ScheduledFuture<?> future = SCHEDULER.scheduleWithFixedDelay(() -> {
-      SimpleObjectPool<T> p = ref.get();
-      if (p == null || p.closed) {
-        ScheduledFuture<?> f = self.get();
-        if (f != null) f.cancel(false);
-        return;
-      }
+    return registration.executor.scheduleWithFixedDelay(() -> {
+      SCHEDULER_LOCK.lock();
       try {
-        body.accept(p);
-      } catch (Throwable t) {
-        log.error("Pool {}: failed to start {} run", p.name, task, t);
+        if (registration.released) return;
+        SimpleObjectPool<T> p = ref.get();
+        if (p == null) {
+          registration.release(true);
+          return;
+        }
+        if (p.closed) {
+          registration.release(false);
+          return;
+        }
+        try {
+          body.accept(p);
+        } catch (Throwable t) {
+          log.error("Pool {}: failed to start {} run", p.name, task, t);
+        }
+      } finally {
+        SCHEDULER_LOCK.unlock();
       }
     }, nanos, nanos, TimeUnit.NANOSECONDS);
-    self.set(future);
-    return future;
+  }
+
+  private static final class SchedulerRegistration {
+    private final String                   name;
+    private final ScheduledExecutorService executor;
+    private boolean                        released;
+    private ScheduledFuture<?>             maintenanceTask;
+    private ScheduledFuture<?>             abandonTask;
+
+    SchedulerRegistration(String name, ScheduledExecutorService executor) {
+      this.name     = name;
+      this.executor = executor;
+    }
+
+    void release(boolean garbageCollected) {
+      SCHEDULER_LOCK.lock();
+      try {
+        if (released) return;
+        released = true;
+        if (maintenanceTask != null) maintenanceTask.cancel(false);
+        if (abandonTask != null) abandonTask.cancel(false);
+        registeredPools--;
+        if (registeredPools == 0) {
+          executor.shutdown();
+          scheduler = null;
+        }
+        if (garbageCollected) {
+          log.warn("Pool {} was garbage collected without close(); its idle objects were never destroyed", name);
+        }
+      } finally {
+        SCHEDULER_LOCK.unlock();
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -180,14 +280,20 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /**
    * Borrows an object, waiting up to {@link SimpleObjectPoolConfig#waitingForObjectTimeout()}.
+   * Creation calls are not interrupted at the deadline. Before any retry, a bounded wait that
+   * has elapsed rethrows the last creation failure unchanged, even when the retry delay is zero.
+   * An {@link Error} from {@code createObject()} or from activating the new object is not retried:
+   * the pool destroys the object if there is one, releases its slot and rethrows the error at once.
    *
    * @return a pooled object, never null
    *
-   * @throws PoolTimeoutException if no object became available in time; if creation failed during
-   *                              the wait, the last creation exception is the cause
-   * @throws PoolClosedException  if the pool is closed, or is closed while waiting
-   * @throws PoolException        if the thread is interrupted; the interrupt flag is restored
-   * @throws RuntimeException     whatever the factory threw from {@code createObject()} once retries are exhausted
+   * @throws PoolTimeoutException          if no object became available in time; if creation failed during
+   *                                       the wait, the last creation exception is the cause
+   * @throws PoolClosedException           if the pool is closed, or is closed while waiting
+   * @throws PoolInterruptedException      if the thread is interrupted; the interrupt flag is restored
+   * @throws PoolObjectValidationException if a newly created object failed validation and retries are exhausted
+   * @throws RuntimeException              whatever the factory threw from {@code createObject()} or from
+   *                                       activating the new object, once retries are exhausted
    */
   public T borrowObject() throws PoolException {
     return borrowObject(config.waitingForObjectTimeout());
@@ -195,10 +301,13 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /**
    * Borrows an object with an explicit wait. A negative duration waits indefinitely and
-   * {@link Duration#ZERO} fails immediately when the pool is exhausted.
+   * {@link Duration#ZERO} fails immediately when the pool is exhausted. The first creation
+   * attempt is always allowed when capacity is free. A bounded wait stops further creation
+   * retries at its deadline by rethrowing the last creation failure unchanged.
    *
    * @param maxWait how long to wait for capacity or an idle object
    * @return a pooled object, never null
+   * @throws PoolInterruptedException if interrupted; the interrupt flag is restored
    * @see #borrowObject()
    */
   public T borrowObject(Duration maxWait) throws PoolException {
@@ -210,6 +319,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     int              createAttemptsLeft = config.maxRetries() + 1;
     RuntimeException lastCreateFailure  = null;
     boolean          retryPending       = false;
+    BorrowWait       borrowWait         = null;
 
     try {
       while (true) {
@@ -227,6 +337,10 @@ public class SimpleObjectPool<T> implements AutoCloseable {
         }
 
         if (p == null) {
+          if (lastCreateFailure != null && !infinite && deadline - System.nanoTime() <= 0) {
+            // A creation already failed and the wait is over: report that failure, not a timeout.
+            throw lastCreateFailure;
+          }
           if (retryPending) {
             // Directly after a failed creation: honour the retry delay, capped at the remaining
             // wait, without holding a slot while we sleep.
@@ -234,16 +348,18 @@ public class SimpleObjectPool<T> implements AutoCloseable {
             long delay = saturatedNanos(config.retryCreationDelay());
             if (delay > 0) {
               long remaining = infinite ? delay : deadline - System.nanoTime();
-              if (remaining <= 0) {
-                throw new PoolTimeoutException("Timed out in pool " + name + " before retrying object creation", lastCreateFailure);
-              }
               TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining));
+              if (!infinite && deadline - System.nanoTime() <= 0) {
+                throw lastCreateFailure;
+              }
             }
           }
           if (reserveSlot()) {
             boolean created = false;
             try {
-              p       = create();
+              PooledObject<T> candidate = create();
+              prepareCreatedForBorrow(candidate);
+              p       = candidate;
               created = true;
               fresh   = true;
             } catch (RuntimeException e) {
@@ -263,13 +379,15 @@ public class SimpleObjectPool<T> implements AutoCloseable {
               continue;
             }
           } else {
-            p = awaitAvailable(infinite, deadline, lastCreateFailure);
+            if (borrowWait == null) borrowWait = new BorrowWait();
+            p = awaitAvailable(infinite, deadline, lastCreateFailure, borrowWait);
             if (p == null) {
               continue; // capacity may have freed up, go round and try to reserve it
             }
           }
         }
 
+        retryPending = false; // got an object; if it fails validation, no retry delay is owed
         T object = p.object();
         if (!fresh && !prepareForBorrow(p)) {
           continue;
@@ -277,7 +395,6 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
         p.markBorrowed();
         borrowed.put(new IdentityKey(object), p);
-        borrowCount.increment();
         if (closed) {
           // Lost the race with close(): behave as if we had returned it to a closed pool.
           if (borrowed.remove(new IdentityKey(object)) != null) {
@@ -285,6 +402,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
           }
           throw new PoolClosedException("Pool " + name + " is closed");
         }
+        borrowCount.increment();
         if (log.isTraceEnabled()) {
           log.trace("Pool {}: borrowed object {} (total={}, idle={})", name, p.id(), total.get(), idle.size());
         }
@@ -292,29 +410,45 @@ public class SimpleObjectPool<T> implements AutoCloseable {
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      throw new PoolException("Interrupted while borrowing from pool " + name, e);
+      throw new PoolInterruptedException("Interrupted while borrowing from pool " + name, e);
+    } finally {
+      if (borrowWait != null && borrowWait.parked) {
+        waitCount.increment();
+        totalWaitNanos.add(borrowWait.nanos);
+        maxWaitNanos.accumulate(borrowWait.nanos);
+      }
     }
   }
 
+  private static final class BorrowWait {
+    private boolean parked;
+    private long    nanos;
+  }
+
   /**
-   * Validates (if configured) and activates an idle object the caller now owns. On any failure
+   * Activates and, if configured, validates an idle object the caller now owns. On any failure
    * the object is destroyed and false is returned; fatal errors are rethrown after cleanup.
    */
   private boolean prepareForBorrow(PooledObject<T> p) {
-    T object = p.object();
+    T         object  = p.object();
+    boolean   valid   = false;
+    Throwable failure = null;
     try {
-      if (config.testOnBorrow() && !factory.isObjectValidForBorrow(object)) {
-        destroy(p, "failed validation on borrow");
-        return false;
-      }
       factory.activateObject(object);
-      return true;
+      valid = !config.testOnBorrow() || factory.isObjectValidForBorrow(object);
     } catch (Throwable t) {
-      destroy(p, "validation or activation on borrow threw");
-      rethrowIfFatal(t);
-      log.warn("Pool {}: validation or activation of object {} threw, destroyed it", name, p.id(), t);
+      failure = t;
+    }
+    if (failure != null) {
+      destroy(p, "activation or validation on borrow threw");
+      rethrowIfFatal(failure);
+      log.warn("Pool {}: activation or validation of object {} threw, destroyed it", name, p.id(), failure);
       return false;
     }
+    if (!valid) {
+      destroy(p, "failed validation on borrow");
+    }
+    return valid;
   }
 
   /**
@@ -322,10 +456,12 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    *
    * @return an idle object, or null if capacity may now be available and the caller should retry
    */
-  private PooledObject<T> awaitAvailable(boolean infinite, long deadline, RuntimeException lastCreateFailure) throws InterruptedException {
+  private PooledObject<T> awaitAvailable(boolean infinite, long deadline, RuntimeException lastCreateFailure, BorrowWait borrowWait) throws InterruptedException {
     waitLock.lockInterruptibly();
     waiters.incrementAndGet();
     boolean consumed = false;
+    boolean parked   = false;
+    long    start    = System.nanoTime();
     try {
       while (true) {
         if (closed) {
@@ -341,16 +477,22 @@ public class SimpleObjectPool<T> implements AutoCloseable {
           return null;
         }
         if (infinite) {
+          parked = true;
           available.await();
         } else {
           long remaining = deadline - System.nanoTime();
           if (remaining <= 0) {
             throw new PoolTimeoutException("Timed out waiting for an object from pool " + name + " (idle=0, total=" + total.get() + "/" + maxPoolSize + ")", lastCreateFailure);
           }
+          parked = true;
           available.awaitNanos(remaining);
         }
       }
     } finally {
+      if (parked) {
+        borrowWait.parked = true;
+        borrowWait.nanos += System.nanoTime() - start;
+      }
       waiters.decrementAndGet();
       if (!consumed) {
         // Leaving on timeout, interrupt or close without taking anything: a signal meant for us
@@ -395,6 +537,18 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * @throws PoolObjectException if the object was not borrowed from this pool
    */
   public void returnObject(T obj, boolean broken) throws PoolObjectException {
+    PooledObject<T> p = claimBorrowed(obj);
+    if (p != null) {
+      finishReturn(p, broken);
+    }
+  }
+
+  /**
+   * Takes a returned object out of the borrowed map. From then on no reclaim can destroy it.
+   *
+   * @return its bookkeeping, or null if the pool already reclaimed it and the return is ignored
+   */
+  private PooledObject<T> claimBorrowed(T obj) {
     if (obj == null) {
       throw new PoolObjectException("Cannot return null to pool " + name);
     }
@@ -402,10 +556,15 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     if (p == null) {
       if (reclaimed.remove(new WeakIdentityKey(obj, null))) {
         log.debug("Pool {}: ignoring return of an object the pool had already reclaimed and destroyed", name);
-        return;
+        return null;
       }
       throw new PoolObjectException("Object is not currently borrowed from pool " + name);
     }
+    return p;
+  }
+
+  private void finishReturn(PooledObject<T> p, boolean broken) {
+    T obj = p.object();
     if (broken) {
       p.markBroken();
     }
@@ -418,16 +577,22 @@ public class SimpleObjectPool<T> implements AutoCloseable {
       destroy(p, "returned as broken");
       return;
     }
+    boolean   valid   = false;
+    Throwable failure = null;
     try {
-      if (config.testOnReturn() && !factory.isObjectValid(obj)) {
-        destroy(p, "failed validation on return");
-        return;
-      }
-      factory.passivateObject(obj);
+      valid = !config.testOnReturn() || factory.isObjectValid(obj);
+      if (valid) factory.passivateObject(obj);
     } catch (Throwable t) {
+      failure = t;
+    }
+    if (failure != null) {
       destroy(p, "validation or passivation on return threw");
-      rethrowIfFatal(t);
-      log.warn("Pool {}: validation or passivation of object {} threw, destroyed it", name, p.id(), t);
+      rethrowIfFatal(failure);
+      log.warn("Pool {}: validation or passivation of object {} threw, destroyed it", name, p.id(), failure);
+      return;
+    }
+    if (!valid) {
+      destroy(p, "failed validation on return");
       return;
     }
 
@@ -475,10 +640,15 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   }
 
   /**
-   * Borrows an object, runs the action, and returns the object. If the action throws, the object
-   * is returned as broken and the exception propagates.
+   * Borrows an object, runs the action, and returns the object. If the action throws, the
+   * exception propagates and the object is destroyed unless
+   * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable.
+   * Failures during that return are reported as described for {@link #apply(Function)}.
+   *
+   * @throws NullPointerException if {@code action} is null; nothing is borrowed
    */
   public void use(Consumer<? super T> action) throws PoolException {
+    Objects.requireNonNull(action, "action");
     apply(obj -> {
       action.accept(obj);
       return null;
@@ -487,24 +657,57 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /**
    * Borrows an object, applies the function, returns the object, and yields the result. If the
-   * function throws, the object is returned as broken and the function's exception propagates;
-   * any exception from the return is attached to it as suppressed.
+   * function throws, the function's exception propagates and the object is destroyed unless
+   * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable. The pool
+   * takes the object back before calling that hook, so the hook never overlaps a reclaim by
+   * abandon detection or {@link #forceClose()}. Any exception from the hook or from the return is
+   * attached to the function's as suppressed, except a {@link VirtualMachineError}, which is
+   * rethrown in its place once the object has been returned.
+   *
+   * @throws NullPointerException if {@code function} is null; nothing is borrowed
    */
   public <R> R apply(Function<? super T, ? extends R> function) throws PoolException {
+    Objects.requireNonNull(function, "function");
     T obj = borrowObject();
     R result;
     try {
       result = function.apply(obj);
     } catch (Throwable t) {
-      try {
-        returnObject(obj, true);
-      } catch (RuntimeException returnFailure) {
-        t.addSuppressed(returnFailure);
-      }
+      returnAfterFailure(obj, t);
       throw t;
     }
     returnObject(obj, false);
     return result;
+  }
+
+  /** Returns an object whose action threw {@code failure}, asking the factory whether it is broken. */
+  private void returnAfterFailure(T obj, Throwable failure) {
+    PooledObject<T> p;
+    try {
+      p = claimBorrowed(obj);
+    } catch (RuntimeException returnFailure) {
+      failure.addSuppressed(returnFailure);
+      return;
+    }
+    if (p == null) {
+      return; // reclaimed while the action ran, so it is already destroyed and there is nothing to ask
+    }
+    boolean   broken      = true; // unknown state: the safe answer if the hook itself fails
+    Throwable hookFailure = null;
+    try {
+      broken = factory.isBrokenBy(obj, failure);
+    } catch (Throwable t) {
+      hookFailure = t;
+    }
+    try {
+      finishReturn(p, broken);
+    } catch (RuntimeException returnFailure) {
+      failure.addSuppressed(returnFailure);
+    }
+    if (hookFailure != null && hookFailure != failure) {
+      rethrowIfFatal(hookFailure);
+      failure.addSuppressed(hookFailure);
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -558,6 +761,36 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     return p;
   }
 
+  /**
+   * Activates and, if configured, validates an object created for the borrower that will get it.
+   * A failure is a creation failure: the object is destroyed and an activation exception
+   * propagates unchanged. The caller must release the slot if this throws.
+   */
+  private void prepareCreatedForBorrow(PooledObject<T> p) {
+    T object = p.object();
+    try {
+      factory.activateObject(object);
+    } catch (Throwable t) {
+      destroyQuietly(p);
+      throw t;
+    }
+    if (!config.testOnBorrow()) {
+      return;
+    }
+    boolean valid;
+    try {
+      valid = factory.isObjectValidForBorrow(object);
+    } catch (Throwable t) {
+      destroyQuietly(p);
+      rethrowIfFatal(t);
+      throw new PoolObjectValidationException("Borrow validation of a newly created object threw in pool " + name, t);
+    }
+    if (!valid) {
+      destroyQuietly(p);
+      throw new PoolObjectValidationException("Newly created object failed borrow validation in pool " + name);
+    }
+  }
+
   /** Destroys an object that owns a slot and releases that slot, whatever the factory does. */
   private void destroy(PooledObject<T> p, String reason) {
     log.debug("Pool {}: destroying object {}: {}", name, p.id(), reason);
@@ -592,11 +825,12 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /**
    * Creates idle objects until the pool holds {@code minPoolSize} idle objects or is full.
+   * The first creation failure is rethrown unchanged; objects already created stay in the pool.
    *
    * @return the number of objects created
    */
   public int prepare() {
-    return ensureMinIdle();
+    return ensureMinIdle(true);
   }
 
   /**
@@ -643,12 +877,17 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   }
 
   private int ensureMinIdle() {
+    return ensureMinIdle(false);
+  }
+
+  private int ensureMinIdle(boolean rethrowCreationFailure) {
     int created = 0;
     while (!closed && idle.size() < config.minPoolSize() && total.get() < maxPoolSize) {
       try {
         if (!addObject()) break;
         created++;
       } catch (RuntimeException e) {
+        if (rethrowCreationFailure) throw e;
         log.warn("Pool {}: could not create object to maintain minPoolSize", name, e);
         break;
       }
@@ -668,7 +907,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     }
     boolean started = false;
     try {
-      Thread.ofVirtual().name(name + "-" + task).start(() -> {
+      Thread thread = Thread.ofVirtual().name(name + "-" + task).unstarted(() -> {
         try {
           body.run();
         } catch (Throwable t) {
@@ -677,6 +916,8 @@ public class SimpleObjectPool<T> implements AutoCloseable {
           busy.set(false);
         }
       });
+      thread.setContextClassLoader(maintenanceContextClassLoader);
+      thread.start();
       started = true;
     } finally {
       if (!started) {
@@ -723,12 +964,12 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
       for (PooledObject<T> p : candidates) {
         if (closed) return;
+        long finished = clearsFinished.get();
         // Take exclusive ownership: once removed, no borrower can reach it.
         if (!idle.remove(p)) {
           idleRemaining--;
           continue;
         }
-        long   epoch  = clearEpoch.get();
         String reason = null;
         try {
           p.markTesting();
@@ -742,21 +983,21 @@ public class SimpleObjectPool<T> implements AutoCloseable {
           log.error("Pool {}: eviction check of object {} threw, destroyed it", name, p.id(), t);
           continue;
         }
-        if (reason == null && clearEpoch.get() != epoch) {
-          reason = "idle queue cleared during idle test";
+        if (reason == null && (closed || clearsStarted.get() > finished)) {
+          reason = closed ? "pool closed during eviction run" : "idle queue cleared during idle test";
         }
         if (reason != null) {
           idleRemaining--;
           destroy(p, reason);
         } else {
           p.markIdleAfterTest(); // state only; the idle timestamp is preserved
-          // Put it back at the cold end so it keeps its place in the reuse order.
+          // Move it to the cold end; RANDOM passes also reorder the idle objects.
           if (lifo) {
             idle.addLast(p);
           } else {
             idle.addFirst(p);
           }
-          if ((closed || clearEpoch.get() != epoch) && idle.remove(p)) {
+          if ((closed || clearsStarted.get() > finished) && idle.remove(p)) {
             destroy(p, closed ? "pool closed during eviction run" : "idle queue cleared during idle test");
           } else {
             signalOne(); // a borrower may have parked while we held the only idle object
@@ -810,29 +1051,34 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     return snapshot;
   }
 
-  private void markReclaimed(T object) {
+  private void drainReclaimedQueue() {
     Reference<?> dead;
     while ((dead = reclaimedQueue.poll()) != null) {
       reclaimed.remove(dead);
     }
-    reclaimed.add(new WeakIdentityKey(object, reclaimedQueue));
   }
 
   /**
-   * Takes a borrowed object away from its holder. The reclaimed marker is placed before the
-   * ownership CAS so a concurrent return by the holder never sees a gap in which the object is
-   * neither borrowed nor reclaimed.
+   * Takes a borrowed object away only while its reclaim condition still holds. The marker and
+   * removal share the map's ownership transition, so a return cannot observe a gap or lose a
+   * marker to an unsuccessful reclaim. Destruction runs after the map compute has finished.
+   * A negative timeout reclaims regardless of the borrow age, for forceClose.
    *
    * @return true if this call took ownership and destroyed the object
    */
-  private boolean reclaimBorrowed(IdentityKey key, PooledObject<T> p, String reason) {
-    markReclaimed(p.object());
-    if (!borrowed.remove(key, p)) {
-      reclaimed.remove(new WeakIdentityKey(p.object(), null));
-      return false;
-    }
-    destroy(p, reason);
-    return true;
+  private boolean reclaimBorrowed(IdentityKey key, PooledObject<T> p, String reason, long timeoutNanos) {
+    drainReclaimedQueue();
+    boolean[] won = {false};
+    borrowed.computeIfPresent(key, (k, v) -> {
+      if (v != p || (timeoutNanos >= 0 && (p.state() != PooledObject.State.BORROWED || p.borrowedNanos() < timeoutNanos))) {
+        return v;
+      }
+      reclaimed.add(new WeakIdentityKey(p.object(), reclaimedQueue));
+      won[0] = true;
+      return null;
+    });
+    if (won[0]) destroy(p, reason);
+    return won[0];
   }
 
   private void abandonCheckRun() {
@@ -841,7 +1087,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
       PooledObject<T> p = entry.getValue();
       if (p.state() != PooledObject.State.BORROWED) continue;
       long heldNanos = p.borrowedNanos();
-      if (heldNanos >= timeoutNanos && reclaimBorrowed(entry.getKey(), p, "abandoned")) {
+      if (heldNanos >= timeoutNanos && reclaimBorrowed(entry.getKey(), p, "abandoned", timeoutNanos)) {
         log.warn("Pool {}: object {} had been borrowed for {} ms, treated it as abandoned and destroyed it", name, p.id(), heldNanos / 1_000_000L);
       }
     }
@@ -852,18 +1098,28 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * object that is being validated by the evictor at this moment. Borrowed objects are unaffected.
    */
   public void destroyAllIdleObjects() {
-    clearEpoch.incrementAndGet();
-    int n = drainIdle("destroyAllIdleObjects");
-    log.info("Pool {}: destroyed {} idle objects, total now {}", name, n, total.get());
+    clearsStarted.incrementAndGet();
+    try {
+      int n = drainIdle("destroyAllIdleObjects");
+      log.info("Pool {}: destroyed {} idle objects, total now {}", name, n, total.get());
+    } finally {
+      clearsFinished.incrementAndGet();
+    }
   }
 
   private int drainIdle(String reason) {
-    int             n = 0;
-    PooledObject<T> p;
+    int                 n     = 0;
+    VirtualMachineError fatal = null;
+    PooledObject<T>     p;
     while ((p = idle.pollFirst()) != null) {
-      destroy(p, reason);
+      try {
+        destroy(p, reason);
+      } catch (VirtualMachineError e) {
+        if (fatal == null) fatal = e; // keep draining: close() runs once, so stopping here would strand the rest
+      }
       n++;
     }
+    if (fatal != null) throw fatal;
     return n;
   }
 
@@ -874,15 +1130,16 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   /**
    * Closes the pool. Idle objects are destroyed now. Borrowed objects stay usable and are
    * destroyed when returned. Threads waiting in {@link #borrowObject()} are woken and throw
-   * {@link PoolClosedException}. Calling this on a closed pool does nothing.
+   * {@link PoolClosedException}. A creation or maintenance run already in progress may finish
+   * after this method returns; an object it produces is destroyed and never handed out. Calling
+   * this on a closed pool does nothing.
    */
   @Override
   public void close() {
     if (!closeStarted.compareAndSet(false, true)) return;
     closed = true;
     log.info("Pool {}: closing (total={}, idle={}, borrowed={})", name, total.get(), idle.size(), borrowed.size());
-    if (maintenanceTask != null) maintenanceTask.cancel(false);
-    if (abandonTask != null) abandonTask.cancel(false);
+    if (schedulerRegistration != null) schedulerRegistration.release(false);
     signalAll();
     drainIdle("pool closed");
     log.info("Pool {}: closed, {} object(s) still borrowed and will be destroyed on return", name, borrowed.size());
@@ -893,10 +1150,20 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * those objects will find them unusable. Use {@link #close()} unless you need this.
    */
   public void forceClose() {
-    close();
-    for (var entry : borrowed.entrySet()) {
-      reclaimBorrowed(entry.getKey(), entry.getValue(), "pool force-closed");
+    VirtualMachineError fatal = null;
+    try {
+      close();
+    } catch (VirtualMachineError e) {
+      fatal = e;
     }
+    for (var entry : borrowed.entrySet()) {
+      try {
+        reclaimBorrowed(entry.getKey(), entry.getValue(), "pool force-closed", -1);
+      } catch (VirtualMachineError e) {
+        if (fatal == null) fatal = e;
+      }
+    }
+    if (fatal != null) throw fatal;
   }
 
   /** @return true once {@link #close()} or {@link #forceClose()} has been called */
@@ -948,7 +1215,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /**
    * @return how many times the given object has been borrowed, or 0 if it is not part of this
-   * pool. Cheap for borrowed objects, a scan for idle ones.
+   * pool or the evictor is testing it. Cheap for borrowed objects, a scan for idle ones.
    */
   public long numOfTimesBorrowed(T obj) {
     if (obj == null) return 0;
@@ -966,7 +1233,8 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /** @return a snapshot of the pool's counters */
   public PoolStats stats() {
-    return new PoolStats(total.get(), idle.size(), borrowed.size(), waiters.get(), idSequence.get(), destroyedCount.get(), borrowCount.sum(), maxPoolSize);
+    return new PoolStats(total.get(), idle.size(), borrowed.size(), waiters.get(), idSequence.get(), destroyedCount.get(), borrowCount.sum(), maxPoolSize,
+                         waitCount.sum(), Duration.ofNanos(totalWaitNanos.sum()), Duration.ofNanos(maxWaitNanos.get()));
   }
 
   @Override
