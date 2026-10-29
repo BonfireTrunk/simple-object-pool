@@ -5,8 +5,11 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -132,6 +135,47 @@ class SimpleObjectPoolPreReleaseTest {
       assertThat(failure.get()).as("holder failure").isNull();
       assertThat(early.get()).as("destroyed before the current borrow timeout").isZero();
     }
+  }
+
+  /**
+   * Deterministic replay of the race above. The abandon scan reads the entry of a borrow that is
+   * past the timeout; before it reclaims, the holder returns the object and a new borrow takes
+   * it. Key and wrapper are the same across borrows, so only the re-check inside the map removal
+   * can refuse the stale reclaim. White-box: reaches the private map and method by reflection.
+   */
+  @Test
+  void staleAbandonDecisionDoesNotReclaimTheNextBorrow() throws Exception {
+    long timeout = Duration.ofMillis(20).toNanos();
+    try (var pool = new SimpleObjectPool<>(config(1).abandonedTimeout(Duration.ofNanos(timeout))
+                                               .durationBetweenAbandonCheckRuns(Duration.ofHours(1)).build(),
+                                           new SimpleObjectPoolRaceAndGuardTest.ControlFactory())) {
+      TestPoolObject obj = pool.borrowObject();
+      sleepQuietly(40); // the first borrow is now past the abandon timeout
+      Map.Entry<?, ?> seen = onlyBorrowedEntry(pool); // what the scan read before deciding
+      pool.returnObject(obj);
+      assertThat(pool.borrowObject()).as("same object and wrapper, fresh borrow").isSameAs(obj);
+
+      assertThat(reclaimBorrowed(pool, seen, timeout)).as("stale reclaim").isFalse();
+      assertThat(obj.isDestroyed()).isFalse();
+      assertThat(pool.borrowedObjectsCount()).isEqualTo(1);
+      pool.returnObject(obj);
+      assertThat(pool.idleObjectCount()).isEqualTo(1);
+    }
+  }
+
+  private static Map.Entry<?, ?> onlyBorrowedEntry(SimpleObjectPool<?> pool) throws ReflectiveOperationException {
+    Field field = SimpleObjectPool.class.getDeclaredField("borrowed");
+    field.setAccessible(true);
+    var entries = ((Map<?, ?>) field.get(pool)).entrySet();
+    assertThat(entries).hasSize(1);
+    var entry = entries.iterator().next();
+    return Map.entry(entry.getKey(), entry.getValue());
+  }
+
+  private static boolean reclaimBorrowed(SimpleObjectPool<?> pool, Map.Entry<?, ?> seen, long timeoutNanos) throws ReflectiveOperationException {
+    Method method = SimpleObjectPool.class.getDeclaredMethod("reclaimBorrowed", seen.getKey().getClass(), PooledObject.class, String.class, long.class);
+    method.setAccessible(true);
+    return (boolean) method.invoke(pool, seen.getKey(), seen.getValue(), "abandoned", timeoutNanos);
   }
 
   @Test

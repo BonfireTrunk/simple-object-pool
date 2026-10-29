@@ -193,7 +193,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     }
   }
 
-  /** Minimal package-private accessors keep scheduler lifecycle tests independent of its implementation. */
+  /** For tests only: lets the scheduler lifecycle tests observe registrations. Not part of the API. */
   static int schedulerRegistrationCount() {
     SCHEDULER_LOCK.lock();
     try {
@@ -203,6 +203,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     }
   }
 
+  /** For tests only: lets the scheduler lifecycle tests observe shutdown and restart. Not part of the API. */
   static ScheduledExecutorService maintenanceScheduler() {
     SCHEDULER_LOCK.lock();
     try {
