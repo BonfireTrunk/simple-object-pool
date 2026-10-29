@@ -3,12 +3,14 @@ package today.bonfire.oss.sop;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
+import today.bonfire.oss.sop.exceptions.PoolClosedException;
 import today.bonfire.oss.sop.exceptions.PoolTimeoutException;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -21,6 +23,7 @@ import java.util.concurrent.locks.LockSupport;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static today.bonfire.oss.sop.TestSupport.awaitUntil;
 import static today.bonfire.oss.sop.TestSupport.sleepQuietly;
 
 /** Runs alone because the stress workers would affect JVM-wide thread-count tests. */
@@ -145,17 +148,20 @@ class SimpleObjectPoolPreReleaseTest {
    */
   @Test
   void staleAbandonDecisionDoesNotReclaimTheNextBorrow() throws Exception {
-    long timeout = Duration.ofMillis(20).toNanos();
+    // The re-borrow must still be younger than the timeout when the replay runs, so the timeout
+    // leaves room for a GC pause and the reflective call is resolved before the re-borrow.
+    long   timeout = Duration.ofMillis(250).toNanos();
+    Method reclaim = reclaimBorrowedMethod();
     try (var pool = new SimpleObjectPool<>(config(1).abandonedTimeout(Duration.ofNanos(timeout))
                                                .durationBetweenAbandonCheckRuns(Duration.ofHours(1)).build(),
                                            new SimpleObjectPoolRaceAndGuardTest.ControlFactory())) {
       TestPoolObject obj = pool.borrowObject();
-      sleepQuietly(40); // the first borrow is now past the abandon timeout
+      sleepQuietly(300); // the first borrow is now past the abandon timeout
       Map.Entry<?, ?> seen = onlyBorrowedEntry(pool); // what the scan read before deciding
       pool.returnObject(obj);
       assertThat(pool.borrowObject()).as("same object and wrapper, fresh borrow").isSameAs(obj);
 
-      assertThat(reclaimBorrowed(pool, seen, timeout)).as("stale reclaim").isFalse();
+      assertThat((boolean) reclaim.invoke(pool, seen.getKey(), seen.getValue(), "abandoned", timeout)).as("stale reclaim").isFalse();
       assertThat(obj.isDestroyed()).isFalse();
       assertThat(pool.borrowedObjectsCount()).isEqualTo(1);
       pool.returnObject(obj);
@@ -172,10 +178,11 @@ class SimpleObjectPoolPreReleaseTest {
     return Map.entry(entry.getKey(), entry.getValue());
   }
 
-  private static boolean reclaimBorrowed(SimpleObjectPool<?> pool, Map.Entry<?, ?> seen, long timeoutNanos) throws ReflectiveOperationException {
-    Method method = SimpleObjectPool.class.getDeclaredMethod("reclaimBorrowed", seen.getKey().getClass(), PooledObject.class, String.class, long.class);
+  private static Method reclaimBorrowedMethod() throws ReflectiveOperationException {
+    Class<?> identityKey = Class.forName(SimpleObjectPool.class.getName() + "$IdentityKey");
+    Method   method      = SimpleObjectPool.class.getDeclaredMethod("reclaimBorrowed", identityKey, PooledObject.class, String.class, long.class);
     method.setAccessible(true);
-    return (boolean) method.invoke(pool, seen.getKey(), seen.getValue(), "abandoned", timeoutNanos);
+    return method;
   }
 
   @Test
@@ -314,6 +321,68 @@ class SimpleObjectPoolPreReleaseTest {
   @Test
   void fatalDestroyAfterReturnValidationReleasesTheSlotOnce() {
     assertFatalDestroyReleasesOnce(false);
+  }
+
+  @Test
+  void fatalDestroyDuringCloseStillDestroysEveryIdleObject() {
+    var fatal   = new OutOfMemoryError("test");
+    var factory = new FirstDestroyFails(fatal);
+    var pool    = new SimpleObjectPool<>(config(3).build(), factory);
+    assertThat(pool.addObjects(3)).isEqualTo(3);
+
+    assertThatThrownBy(pool::close).isSameAs(fatal);
+    assertThat(factory.calls.get()).isEqualTo(3);
+    assertThat(pool.idleObjectCount()).isZero();
+    assertThat(pool.currentPoolSize()).isZero();
+  }
+
+  @Test
+  void fatalDestroyDuringForceCloseStillDestroysEveryBorrowedObject() {
+    var fatal   = new OutOfMemoryError("test");
+    var factory = new FirstDestroyFails(fatal);
+    var pool    = new SimpleObjectPool<>(config(3).build(), factory);
+    var held    = List.of(pool.borrowObject(), pool.borrowObject(), pool.borrowObject());
+
+    assertThatThrownBy(pool::forceClose).isSameAs(fatal);
+    assertThat(factory.calls.get()).isEqualTo(3);
+    assertThat(held).allMatch(TestPoolObject::isDestroyed);
+    assertThat(pool.borrowedObjectsCount()).isZero();
+    assertThat(pool.currentPoolSize()).isZero();
+  }
+
+  private static final class FirstDestroyFails extends SimpleObjectPoolRaceAndGuardTest.ControlFactory {
+    final AtomicInteger    calls = new AtomicInteger();
+    final OutOfMemoryError fatal;
+
+    FirstDestroyFails(OutOfMemoryError fatal) {
+      this.fatal = fatal;
+    }
+
+    @Override
+    public void destroyObject(TestPoolObject obj) {
+      super.destroyObject(obj);
+      if (calls.incrementAndGet() == 1) throw fatal;
+    }
+  }
+
+  @Test
+  void borrowRejectedByCloseIsNotCountedAsABorrow() throws Exception {
+    var factory = new SimpleObjectPoolRaceAndGuardTest.ControlFactory();
+    factory.createGate = new CountDownLatch(1);
+    var pool   = new SimpleObjectPool<>(config(1).build(), factory);
+    var thrown = new AtomicReference<Throwable>();
+    Thread borrower = Thread.ofVirtual().start(() -> run(pool::borrowObject, thrown));
+    awaitUntil("borrower inside createObject", AWAIT, () -> factory.inCreate);
+
+    pool.close();
+    factory.createGate.countDown();
+    borrower.join(5000);
+
+    assertThat(thrown.get()).isInstanceOf(PoolClosedException.class);
+    assertThat(pool.stats().borrows()).isZero();
+    assertThat(pool.numOfTimesBorrowedFromPool()).isZero();
+    assertThat(factory.destroyed.get()).isEqualTo(1);
+    assertThat(pool.currentPoolSize()).isZero();
   }
 
   private static void assertFatalDestroyReleasesOnce(boolean onBorrow) {

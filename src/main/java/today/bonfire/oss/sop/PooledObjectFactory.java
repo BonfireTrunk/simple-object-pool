@@ -99,8 +99,10 @@ public interface PooledObjectFactory<T> {
    * the object; false returns it to the pool like a normal return, including {@code testOnReturn}
    * and {@link #passivateObject(Object)}. The default returns true because the pool cannot know
    * what state the action left the object in. Override it to keep objects through failures that
-   * leave them intact, for example an error reply that was read in full. If this method throws,
-   * the object is destroyed. Leases and direct {@code returnObject} calls do not consult it.
+   * leave them intact, for example an error reply that was read in full. The pool takes the object
+   * back before calling this, so it never runs while the object is being reclaimed and destroyed;
+   * an object the pool already reclaimed is not passed to it. If this method throws, the object is
+   * destroyed. Leases and direct {@code returnObject} calls do not consult it.
    *
    * @param obj   the object the action was using
    * @param error what the action threw

@@ -282,6 +282,8 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * Borrows an object, waiting up to {@link SimpleObjectPoolConfig#waitingForObjectTimeout()}.
    * Creation calls are not interrupted at the deadline. Before any retry, a bounded wait that
    * has elapsed rethrows the last creation failure unchanged, even when the retry delay is zero.
+   * An {@link Error} from {@code createObject()} or from activating the new object is not retried:
+   * the pool destroys the object if there is one, releases its slot and rethrows the error at once.
    *
    * @return a pooled object, never null
    *
@@ -393,7 +395,6 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
         p.markBorrowed();
         borrowed.put(new IdentityKey(object), p);
-        borrowCount.increment();
         if (closed) {
           // Lost the race with close(): behave as if we had returned it to a closed pool.
           if (borrowed.remove(new IdentityKey(object)) != null) {
@@ -401,6 +402,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
           }
           throw new PoolClosedException("Pool " + name + " is closed");
         }
+        borrowCount.increment();
         if (log.isTraceEnabled()) {
           log.trace("Pool {}: borrowed object {} (total={}, idle={})", name, p.id(), total.get(), idle.size());
         }
@@ -535,6 +537,18 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * @throws PoolObjectException if the object was not borrowed from this pool
    */
   public void returnObject(T obj, boolean broken) throws PoolObjectException {
+    PooledObject<T> p = claimBorrowed(obj);
+    if (p != null) {
+      finishReturn(p, broken);
+    }
+  }
+
+  /**
+   * Takes a returned object out of the borrowed map. From then on no reclaim can destroy it.
+   *
+   * @return its bookkeeping, or null if the pool already reclaimed it and the return is ignored
+   */
+  private PooledObject<T> claimBorrowed(T obj) {
     if (obj == null) {
       throw new PoolObjectException("Cannot return null to pool " + name);
     }
@@ -542,10 +556,15 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     if (p == null) {
       if (reclaimed.remove(new WeakIdentityKey(obj, null))) {
         log.debug("Pool {}: ignoring return of an object the pool had already reclaimed and destroyed", name);
-        return;
+        return null;
       }
       throw new PoolObjectException("Object is not currently borrowed from pool " + name);
     }
+    return p;
+  }
+
+  private void finishReturn(PooledObject<T> p, boolean broken) {
+    T obj = p.object();
     if (broken) {
       p.markBroken();
     }
@@ -624,8 +643,12 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * Borrows an object, runs the action, and returns the object. If the action throws, the
    * exception propagates and the object is destroyed unless
    * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable.
+   * Failures during that return are reported as described for {@link #apply(Function)}.
+   *
+   * @throws NullPointerException if {@code action} is null; nothing is borrowed
    */
   public void use(Consumer<? super T> action) throws PoolException {
+    Objects.requireNonNull(action, "action");
     apply(obj -> {
       action.accept(obj);
       return null;
@@ -635,10 +658,16 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   /**
    * Borrows an object, applies the function, returns the object, and yields the result. If the
    * function throws, the function's exception propagates and the object is destroyed unless
-   * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable. Any
-   * exception from that hook or from the return is attached to the function's as suppressed.
+   * {@link PooledObjectFactory#isBrokenBy(Object, Throwable)} says it is still usable. The pool
+   * takes the object back before calling that hook, so the hook never overlaps a reclaim by
+   * abandon detection or {@link #forceClose()}. Any exception from the hook or from the return is
+   * attached to the function's as suppressed, except a {@link VirtualMachineError}, which is
+   * rethrown in its place once the object has been returned.
+   *
+   * @throws NullPointerException if {@code function} is null; nothing is borrowed
    */
   public <R> R apply(Function<? super T, ? extends R> function) throws PoolException {
+    Objects.requireNonNull(function, "function");
     T obj = borrowObject();
     R result;
     try {
@@ -653,6 +682,16 @@ public class SimpleObjectPool<T> implements AutoCloseable {
 
   /** Returns an object whose action threw {@code failure}, asking the factory whether it is broken. */
   private void returnAfterFailure(T obj, Throwable failure) {
+    PooledObject<T> p;
+    try {
+      p = claimBorrowed(obj);
+    } catch (RuntimeException returnFailure) {
+      failure.addSuppressed(returnFailure);
+      return;
+    }
+    if (p == null) {
+      return; // reclaimed while the action ran, so it is already destroyed and there is nothing to ask
+    }
     boolean   broken      = true; // unknown state: the safe answer if the hook itself fails
     Throwable hookFailure = null;
     try {
@@ -661,7 +700,7 @@ public class SimpleObjectPool<T> implements AutoCloseable {
       hookFailure = t;
     }
     try {
-      returnObject(obj, broken);
+      finishReturn(p, broken);
     } catch (RuntimeException returnFailure) {
       failure.addSuppressed(returnFailure);
     }
@@ -1069,12 +1108,18 @@ public class SimpleObjectPool<T> implements AutoCloseable {
   }
 
   private int drainIdle(String reason) {
-    int             n = 0;
-    PooledObject<T> p;
+    int                 n     = 0;
+    VirtualMachineError fatal = null;
+    PooledObject<T>     p;
     while ((p = idle.pollFirst()) != null) {
-      destroy(p, reason);
+      try {
+        destroy(p, reason);
+      } catch (VirtualMachineError e) {
+        if (fatal == null) fatal = e; // keep draining: close() runs once, so stopping here would strand the rest
+      }
       n++;
     }
+    if (fatal != null) throw fatal;
     return n;
   }
 
@@ -1105,10 +1150,20 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * those objects will find them unusable. Use {@link #close()} unless you need this.
    */
   public void forceClose() {
-    close();
-    for (var entry : borrowed.entrySet()) {
-      reclaimBorrowed(entry.getKey(), entry.getValue(), "pool force-closed", -1);
+    VirtualMachineError fatal = null;
+    try {
+      close();
+    } catch (VirtualMachineError e) {
+      fatal = e;
     }
+    for (var entry : borrowed.entrySet()) {
+      try {
+        reclaimBorrowed(entry.getKey(), entry.getValue(), "pool force-closed", -1);
+      } catch (VirtualMachineError e) {
+        if (fatal == null) fatal = e;
+      }
+    }
+    if (fatal != null) throw fatal;
   }
 
   /** @return true once {@link #close()} or {@link #forceClose()} has been called */
