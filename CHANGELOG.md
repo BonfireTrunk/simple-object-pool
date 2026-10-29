@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.0.0] - 2026-10-29
 
 This release rewrites the pool core. The 2.x design kept one lock across borrow, return and
 eviction, and held it while calling your factory, so a single slow connection could stall
