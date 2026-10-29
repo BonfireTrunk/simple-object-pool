@@ -130,8 +130,6 @@ public class SimpleObjectPool<T> implements AutoCloseable {
    * Creates a pool with its own name, allowing multiple pools to share a config.
    *
    * @param name the name used in logs, thread names and exceptions
-   * @param config the pool configuration
-   * @param factory the object lifecycle factory
    * @throws IllegalArgumentException if the name is null or blank
    */
   public SimpleObjectPool(String name, SimpleObjectPoolConfig config, PooledObjectFactory<T> factory) {
@@ -1128,7 +1126,6 @@ public class SimpleObjectPool<T> implements AutoCloseable {
     return factory;
   }
 
-  /** @return objects currently handed out */
   public int borrowedObjectsCount() {
     return borrowed.size();
   }

@@ -78,7 +78,6 @@ class SimpleObjectPoolTest {
     TestPoolObject obj2 = new TestPoolObject();
     when(factory.createObject()).thenReturn(obj1).thenReturn(obj2);
 
-    // Populate pool
     var b1 = pool.borrowObject();
     var b2 = pool.borrowObject();
     pool.returnObject(b1);
@@ -205,7 +204,6 @@ class SimpleObjectPoolTest {
   void testPoolExhaustion() {
     when(factory.createObject()).thenAnswer(inv -> new TestPoolObject());
 
-    // Borrow up to max pool size
     for (int i = 0; i < MAX_POOL_SIZE; i++) {
       assertThat(pool.borrowObject()).isNotNull();
     }
@@ -531,7 +529,6 @@ class SimpleObjectPoolTest {
     awaitUntil("oldest object to be evicted", AWAIT, () -> localPool.currentPoolSize() == 2);
     verify(factory).destroyObject(obj1);
 
-    // borrow again to test
     var borrowedAgain1 = localPool.borrowObject();
     var borrowedAgain2 = localPool.borrowObject();
 
@@ -796,7 +793,6 @@ class SimpleObjectPoolTest {
         .as("Pool size should be 1 after successful creation (despite initial failure)")
         .isEqualTo(1);
 
-    // Now force total failure
     doThrow(new RuntimeException("Always fail")).when(failingFactory).createObject();
 
     assertThatThrownBy(localPool::borrowObject)
@@ -909,7 +905,6 @@ class SimpleObjectPoolTest {
             for (int j = 0; j < iterations; j++) {
               try {
                 TestPoolObject obj = localPool.borrowObject();
-                // fast return
                 localPool.returnObject(obj);
               } catch (PoolTimeoutException e) {
                 timeouts.incrementAndGet();
@@ -931,7 +926,6 @@ class SimpleObjectPoolTest {
     assertThat(finished).as("Test did not finish in time").isTrue();
     assertThat(errors.get()).as("Unexpected errors during stress test").isEqualTo(0);
 
-    // Invariants check
     assertThat(localPool.currentPoolSize())
         .as("Pool size should verify: current <= max")
         .isLessThanOrEqualTo(maxPoolSize);

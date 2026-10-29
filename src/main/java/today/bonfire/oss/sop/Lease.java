@@ -25,7 +25,6 @@ public final class Lease<T> implements AutoCloseable {
     this.object = object;
   }
 
-  /** @return the borrowed object */
   public T get() {
     return object;
   }

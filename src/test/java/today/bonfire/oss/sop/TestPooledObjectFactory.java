@@ -120,12 +120,10 @@ public class TestPooledObjectFactory implements PooledObjectFactory<TestPoolObje
 
   @Override
   public void activateObject(TestPoolObject obj) {
-    // Do nothing
   }
 
   @Override
   public void passivateObject(TestPoolObject obj) {
-    // Do nothing
   }
 
   @Override

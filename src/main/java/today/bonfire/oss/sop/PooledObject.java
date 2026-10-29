@@ -17,9 +17,7 @@ public final class PooledObject<T> {
 
   /** Where an object is in its lifecycle. */
   public enum State {
-    /** Available in the idle queue. */
     IDLE,
-    /** Handed out to a caller. */
     BORROWED,
     /** Temporarily removed from the idle queue while the evictor validates it. */
     TESTING,
@@ -48,7 +46,6 @@ public final class PooledObject<T> {
     this.idleSinceNanos   = System.nanoTime();
   }
 
-  /** @return the wrapped object */
   public T object() {
     return object;
   }
@@ -73,7 +70,6 @@ public final class PooledObject<T> {
     return lastReturnedTime;
   }
 
-  /** @return how many times this object has been borrowed */
   public long borrowCount() {
     return borrowCount.get();
   }
@@ -96,7 +92,6 @@ public final class PooledObject<T> {
     return System.nanoTime() - borrowedSinceNanos;
   }
 
-  /** @return the current lifecycle state */
   public State state() {
     return state;
   }
