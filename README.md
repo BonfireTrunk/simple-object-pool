@@ -29,12 +29,13 @@ a factory call is still a point where every borrower and returner queues up behi
 
 This pool takes a different approach:
 
-- The hot path is lock-free. Borrowing an idle object and returning a healthy one touch a
-  concurrent deque, a concurrent map and a few atomic counters. Nothing else.
+- The hot path takes no pool-wide lock. Borrowing an idle object and returning a healthy one
+  touch a concurrent deque, a concurrent map and a few atomic counters. Nothing else.
 - Capacity is a compare-and-set counter rather than a lock, so a cold start with many threads
   opens connections in parallel instead of one at a time.
-- Your factory is never called while the pool holds a lock. A slow endpoint stalls only the
-  threads that touch it.
+- Your factory is never called while the pool holds a lock that borrowers or returners wait on.
+  Eviction passes are serialised among themselves. A slow endpoint stalls only the threads that
+  touch it.
 - The only lock on the borrow path is taken when the pool is exhausted, and its single job is
   to park the caller until something frees up.
 - There is no `synchronized` and no `Object.wait()` anywhere in the library. Under JDK Flight
@@ -90,6 +91,9 @@ try (var pool = new SimpleObjectPool<>(config, new ConnectionFactory())) {
 If the action you pass to `use` or `apply` throws, the object is returned as broken and
 destroyed, and your exception propagates unchanged.
 
+When two pools share a config but need distinct names, use
+`new SimpleObjectPool<>("pool-name", config, factory)`.
+
 ## How it behaves
 
 **Capacity.** There are never more than `maxPoolSize` objects alive, counting ones that are
@@ -98,7 +102,9 @@ still being created.
 **Waiting.** When the pool is empty and full, `borrowObject()` waits up to
 `waitingForObjectTimeout` for a return or a freed slot and then throws `PoolTimeoutException`.
 A negative timeout waits forever and `Duration.ZERO` fails immediately. You can override the
-wait per call with `borrowObject(Duration)`.
+wait per call with `borrowObject(Duration)`. Creation retries stop when a bounded borrow
+deadline passes and rethrow the last creation failure; the first creation attempt is always
+allowed, so a slow factory call can finish after the deadline.
 
 **Fairness.** By default a thread that just returned an object can grab it straight back
 before a parked waiter wakes up. That is the fastest option. If you care more about bounded
@@ -130,10 +136,14 @@ long time, for example a pub/sub subscription or a blocking read.
 `PoolClosedException`. Objects that are currently borrowed stay usable and are destroyed when
 they come back. `forceClose()` destroys them immediately instead, which is the right call when
 you need everything torn down and do not trust callers to return in time.
+A creation or maintenance run already in progress may finish after `close()` returns; any object
+it produces is destroyed and is never handed out.
 
-**Threads.** One daemon thread per JVM ticks maintenance for every pool. Each run executes on
-its own virtual thread, so pools never block each other, a slow validation never delays a
-refill, and a pool you forget to close will not keep the JVM alive.
+**Threads.** One daemon thread ticks maintenance for every pool that has a scheduled task. Each
+run executes on its own virtual thread, so pools never block each other, a slow validation
+never delays a refill, and a pool you forget to close will not keep the JVM alive. The
+scheduler shuts down after its last pool closes. Maintenance virtual threads use the context
+class loader from the thread that created their pool.
 
 **Identity.** Objects are tracked by reference. The pool never calls `equals` or `hashCode` on
 them and never writes anything into them, so any class can be pooled without changes.
@@ -167,6 +177,9 @@ cannot make an object look stale or abandoned.
 `config.toBuilder()` gives you a builder preloaded with every setting, handy for deriving one
 pool's config from another.
 
+`prepare()` creates up to `minPoolSize` idle objects. If creation fails, it rethrows that first
+failure unchanged and leaves objects created before it in the pool.
+
 ## Factory lifecycle
 
 | Method | Required | Called |
@@ -190,10 +203,14 @@ The pool does not interrupt factory calls.
 ## Observability
 
 `pool.stats()` returns a `PoolStats` record with the total, idle, borrowed and waiting counts
-plus lifetime created, destroyed and borrow counters. Each figure is also available on its own
-(`idleObjectCount()`, `borrowedObjectsCount()`, `waitingCount()` and so on). The pool logs at
-`INFO` when it is created or closed, at `WARN` when something it did not expect happens, and
-at `DEBUG` for every object it destroys and why.
+plus lifetime created, destroyed and borrow counters. `waits`, `totalWait` and `maxWait` cover
+borrow calls that had to park: how many there were (counted when the call finishes, whether it
+got an object or not), their total parking time and the longest one. A borrow that never parks
+leaves them unchanged. Each count is also available on its own (`idleObjectCount()`,
+`borrowedObjectsCount()`, `waitingCount()` and so on). The pool logs at `INFO` when it is
+created or closed, at `WARN` when something it did not expect happens, and at `DEBUG` for every
+object it destroys and why. It also warns once when a pool with scheduled maintenance is
+garbage collected without `close()`, because its idle objects were never destroyed.
 
 ## Exceptions
 
@@ -202,6 +219,7 @@ All pool exceptions are unchecked and extend `PoolException`.
 | Exception | When |
 |---|---|
 | `PoolTimeoutException` | No object became available within the wait |
+| `PoolInterruptedException` | A borrow was interrupted; the interrupt flag is restored |
 | `PoolClosedException` | Borrow on a closed pool, or the pool closed while you were waiting |
 | `PoolObjectException` | Returning null, or an object that was never borrowed from this pool |
 | `PoolObjectValidationException` | A newly created object failed `testOnCreate` validation |

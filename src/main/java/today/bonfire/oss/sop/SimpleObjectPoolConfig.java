@@ -19,7 +19,7 @@ import java.util.UUID;
  * Summary of the settings:
  * <ul>
  *   <li><b>Capacity</b>: {@code maxPoolSize} is the upper bound of objects (idle plus borrowed).
- *   {@code minPoolSize} is the number of objects the scheduled maintenance task tries to keep.</li>
+ *   {@code minPoolSize} is the number of idle objects the scheduled maintenance task tries to keep.</li>
  *   <li><b>Idle ordering</b>: {@code lifo} (default {@code true}) hands out the most recently returned idle
  *   object first, otherwise the least recently returned one. {@code fairness} controls whether waiting
  *   borrowers are served in arrival order.</li>
@@ -41,134 +41,25 @@ public class SimpleObjectPoolConfig {
 
   private static final Logger log = LoggerFactory.getLogger(SimpleObjectPoolConfig.class);
 
-  private final String poolName;
-
-  /**
-   * Returns the maximum number of objects that the pool can hold.
-   *
-   * @return The maximum pool size.
-   */
-  private final int maxPoolSize;
-
-  /**
-   * Returns the minimum number of objects that the pool should maintain.
-   *
-   * @return The minimum pool size.
-   */
-  private final int minPoolSize;
-
-  /**
-   * Returns whether the pool should use a fair queuing policy.
-   *
-   * @return {@code true} if the pool should use a fair queuing policy,
-   *     {@code false} otherwise.
-   */
-  private final boolean fairness;
-
-  /**
-   * Returns whether idle objects are handed out last-in-first-out.
-   *
-   * @return {@code true} if the most recently returned idle object is borrowed first,
-   *     {@code false} if the least recently returned one is borrowed first.
-   */
-  private final boolean lifo;
-
-  /**
-   * Returns whether objects should be tested upon creation.
-   *
-   * @return {@code true} if objects should be tested upon creation, {@code false}
-   *     otherwise.
-   */
-  private final boolean testOnCreate;
-
-  /**
-   * Returns whether objects should be tested before being borrowed from the pool.
-   *
-   * @return {@code true} if objects should be tested before being borrowed,
-   *     {@code false} otherwise.
-   */
-  private final boolean testOnBorrow;
-
-  /**
-   * Returns whether objects should be tested when returned to the pool.
-   *
-   * @return {@code true} if objects should be tested when returned, {@code false}
-   *     otherwise.
-   */
-  private final boolean testOnReturn;
-
-  /**
-   * Returns whether objects should be tested while they are idle in the pool.
-   *
-   * @return {@code true} if objects should be tested while idle, {@code false}
-   *     otherwise.
-   */
-  private final boolean testWhileIdle;
-
-  /**
-   * Returns the duration between runs of the abandoned object check.
-   *
-   * @return The duration between abandoned object check runs.
-   */
-  private final Duration durationBetweenAbandonCheckRuns;
-
-  /**
-   * Returns the timeout after which a borrowed object is considered abandoned.
-   *
-   * @return The abandoned timeout, or {@code null} if abandon detection is disabled.
-   */
-  private final Duration abandonedTimeout;
-
-  /**
-   * Returns the duration between runs of the eviction process.
-   *
-   * @return The duration between eviction runs.
-   */
-  private final Duration durationBetweenEvictionsRuns;
-
-  /**
-   * Returns the timeout duration for an idle object to be considered for eviction.
-   *
-   * @return The object eviction timeout.
-   */
-  private final Duration objEvictionTimeout;
-
-  /**
-   * Returns the number of objects to test per eviction run.
-   *
-   * @return The number of objects to test per eviction run.
-   */
-  private final int numValidationsPerEvictionRun;
-
-  /**
-   * Returns the eviction policy to use when evicting objects from the pool.
-   *
-   * @return The eviction policy.
-   */
+  private final String         poolName;
+  private final int            maxPoolSize;
+  private final int            minPoolSize;
+  private final boolean        fairness;
+  private final boolean        lifo;
+  private final boolean        testOnCreate;
+  private final boolean        testOnBorrow;
+  private final boolean        testOnReturn;
+  private final boolean        testWhileIdle;
+  private final Duration       durationBetweenAbandonCheckRuns;
+  private final Duration       abandonedTimeout;
+  private final Duration       durationBetweenEvictionsRuns;
+  private final Duration       objEvictionTimeout;
+  private final int            numValidationsPerEvictionRun;
+  private final boolean        numValidationsPerEvictionRunSet;
   private final EvictionPolicy evictionPolicy;
-
-  /**
-   * Returns the maximum number of creation retries when borrowing an object from the pool.
-   * Zero means exactly one creation attempt per borrow.
-   *
-   * @return The maximum number of retries.
-   */
-  private final int maxRetries;
-
-  /**
-   * Returns the delay between retries when creating objects for the pool.
-   * This is applicable during the object creation failure scenario.
-   *
-   * @return The retry delay.
-   */
-  private final Duration retryCreationDelay;
-
-  /**
-   * Returns the timeout duration for waiting for an object to become available in the pool.
-   *
-   * @return The waiting for object timeout.
-   */
-  private final Duration waitingForObjectTimeout;
+  private final int            maxRetries;
+  private final Duration       retryCreationDelay;
+  private final Duration       waitingForObjectTimeout;
 
   protected SimpleObjectPoolConfig(Builder builder) {
     this.poolName                        = builder.poolName;
@@ -181,13 +72,14 @@ public class SimpleObjectPoolConfig {
     this.testOnReturn                    = builder.testOnReturn;
     this.testWhileIdle                   = builder.testWhileIdle;
     this.durationBetweenAbandonCheckRuns = builder.durationBetweenAbandonCheckRuns;
-    this.abandonedTimeout                = builder.abandonedTimeout;
+    this.abandonedTimeout                = normalisedAbandonedTimeout(builder.abandonedTimeout);
     this.durationBetweenEvictionsRuns    = builder.durationBetweenEvictionsRuns;
     this.objEvictionTimeout              = builder.objEvictionTimeout;
-    this.numValidationsPerEvictionRun    = builder.numValidationsPerEvictionRun;
+    this.numValidationsPerEvictionRun    = builder.numValidationsPerEvictionRun == null ? builder.maxPoolSize : builder.numValidationsPerEvictionRun;
+    this.numValidationsPerEvictionRunSet = builder.numValidationsPerEvictionRun != null;
     this.evictionPolicy                  = builder.evictionPolicy;
     this.maxRetries                      = builder.maxRetries;
-    this.retryCreationDelay              = builder.retryCreationDelay;
+    this.retryCreationDelay              = normalisedRetryCreationDelay(builder.retryCreationDelay);
     this.waitingForObjectTimeout         = builder.waitingForObjectTimeout;
   }
 
@@ -199,47 +91,103 @@ public class SimpleObjectPoolConfig {
     return new Builder().build();
   }
 
-  // Getters
+  /** @return the name used for logging and debugging */
   public String poolName() {
     return poolName;
   }
 
+  /**
+   * Returns the maximum number of objects that the pool can hold.
+   *
+   * @return The maximum pool size.
+   */
   public int maxPoolSize() {
     return maxPoolSize;
   }
 
+  /**
+   * Returns the minimum number of idle objects that the pool should maintain.
+   *
+   * @return The minimum number of idle objects.
+   */
   public int minPoolSize() {
     return minPoolSize;
   }
 
+  /**
+   * Returns whether the pool should use a fair queuing policy.
+   *
+   * @return {@code true} if the pool should use a fair queuing policy,
+   *     {@code false} otherwise.
+   */
   public boolean fairness() {
     return fairness;
   }
 
+  /**
+   * Returns whether idle objects are handed out last-in-first-out.
+   *
+   * @return {@code true} if the most recently returned idle object is borrowed first,
+   *     {@code false} if the least recently returned one is borrowed first.
+   */
   public boolean lifo() {
     return lifo;
   }
 
+  /**
+   * Returns whether objects should be tested upon creation.
+   *
+   * @return {@code true} if objects should be tested upon creation, {@code false}
+   *     otherwise.
+   */
   public boolean testOnCreate() {
     return testOnCreate;
   }
 
+  /**
+   * Returns whether objects should be tested before being borrowed from the pool.
+   *
+   * @return {@code true} if objects should be tested before being borrowed,
+   *     {@code false} otherwise.
+   */
   public boolean testOnBorrow() {
     return testOnBorrow;
   }
 
+  /**
+   * Returns whether objects should be tested when returned to the pool.
+   *
+   * @return {@code true} if objects should be tested when returned, {@code false}
+   *     otherwise.
+   */
   public boolean testOnReturn() {
     return testOnReturn;
   }
 
+  /**
+   * Returns whether objects should be tested while they are idle in the pool.
+   *
+   * @return {@code true} if objects should be tested while idle, {@code false}
+   *     otherwise.
+   */
   public boolean testWhileIdle() {
     return testWhileIdle;
   }
 
+  /**
+   * Returns the duration between runs of the abandoned object check.
+   *
+   * @return The duration between abandoned object check runs.
+   */
   public Duration durationBetweenAbandonCheckRuns() {
     return durationBetweenAbandonCheckRuns;
   }
 
+  /**
+   * Returns the timeout after which a borrowed object is considered abandoned.
+   *
+   * @return The abandoned timeout, or {@code null} if abandon detection is disabled.
+   */
   public Duration abandonedTimeout() {
     return abandonedTimeout;
   }
@@ -253,36 +201,74 @@ public class SimpleObjectPoolConfig {
     return abandonedTimeout != null;
   }
 
+  /**
+   * Returns the duration between runs of the eviction process.
+   *
+   * @return The duration between eviction runs.
+   */
   public Duration durationBetweenEvictionsRuns() {
     return durationBetweenEvictionsRuns;
   }
 
+  /**
+   * Returns the timeout duration for an idle object to be considered for eviction.
+   *
+   * @return The object eviction timeout.
+   */
   public Duration objEvictionTimeout() {
     return objEvictionTimeout;
   }
 
+  /**
+   * Returns the number of objects to test per eviction run.
+   *
+   * @return The explicit number of objects to test per eviction run, or {@link #maxPoolSize()}
+   *         when it was not set.
+   */
   public int numValidationsPerEvictionRun() {
     return numValidationsPerEvictionRun;
   }
 
+  /**
+   * Returns the eviction policy to use when evicting objects from the pool.
+   *
+   * @return The eviction policy.
+   */
   public EvictionPolicy evictionPolicy() {
     return evictionPolicy;
   }
 
+  /**
+   * Returns the maximum number of creation retries when borrowing an object from the pool.
+   * Zero means exactly one creation attempt per borrow.
+   *
+   * @return The maximum number of retries.
+   */
   public int maxRetries() {
     return maxRetries;
   }
 
+  /**
+   * Returns the delay between retries when creating objects for the pool.
+   * This is applicable during the object creation failure scenario.
+   *
+   * @return The retry delay.
+   */
   public Duration retryCreationDelay() {
     return retryCreationDelay;
   }
 
+  /**
+   * Returns the timeout duration for waiting for an object to become available in the pool.
+   *
+   * @return The waiting for object timeout.
+   */
   public Duration waitingForObjectTimeout() {
     return waitingForObjectTimeout;
   }
 
   public Builder toBuilder() {
-    return new Builder()
+    Builder builder = new Builder()
         .poolName(this.poolName)
         .maxPoolSize(this.maxPoolSize)
         .minPoolSize(this.minPoolSize)
@@ -296,11 +282,22 @@ public class SimpleObjectPoolConfig {
         .abandonedTimeout(this.abandonedTimeout)
         .durationBetweenEvictionsRuns(this.durationBetweenEvictionsRuns)
         .objEvictionTimeout(this.objEvictionTimeout)
-        .numValidationsPerEvictionRun(this.numValidationsPerEvictionRun)
         .evictionPolicy(this.evictionPolicy)
         .maxRetries(this.maxRetries)
         .retryCreationDelay(this.retryCreationDelay)
         .waitingForObjectTimeout(this.waitingForObjectTimeout);
+    if (numValidationsPerEvictionRunSet) {
+      builder.numValidationsPerEvictionRun(this.numValidationsPerEvictionRun);
+    }
+    return builder;
+  }
+
+  private static Duration normalisedAbandonedTimeout(Duration abandonedTimeout) {
+    return abandonedTimeout != null && (abandonedTimeout.isZero() || abandonedTimeout.isNegative()) ? null : abandonedTimeout;
+  }
+
+  private static Duration normalisedRetryCreationDelay(Duration retryCreationDelay) {
+    return retryCreationDelay != null && retryCreationDelay.isNegative() ? Duration.ZERO : retryCreationDelay;
   }
 
   /**
@@ -368,13 +365,13 @@ public class SimpleObjectPoolConfig {
     }
 
     /**
-     * Sets the minimum number of objects that the pool should maintain.
+     * Sets the minimum number of idle objects that the pool should maintain.
      * Note setting a positive value does not guarantee that the pool will have at least the specified number
-     * of objects rather it suggests that the pool should attempt to maintain the specified number of objects.
+     * of idle objects rather it suggests that the pool should attempt to maintain the specified number of idle objects.
      * The scheduled maintenance task tops the pool up to this number, so a positive value requires a positive
      * {@code durationBetweenEvictionsRuns} even when the eviction policy is {@link EvictionPolicy#NONE}.
      *
-     * @param minPoolSize The minimum pool size.
+     * @param minPoolSize The minimum number of idle objects.
      *
      * @return This {@code Builder} instance.
      */
@@ -579,8 +576,9 @@ public class SimpleObjectPoolConfig {
 
     /**
      * Sets the delay between retries when creating an object for the pool.
-     * This is applicable during the object creation failure scenario case only.
-     * Negative values are treated as zero. The pool caps the delay at the remaining wait time of the borrow.
+     * This is applicable during the object creation failure scenario only. Negative values are treated as zero.
+     * A bounded borrow sleeps no longer than its remaining wait and does not make another creation attempt
+     * after that wait has elapsed.
      *
      * @param retryCreationDelay The retry delay.
      *
@@ -619,6 +617,8 @@ public class SimpleObjectPoolConfig {
      * behavior.
      */
     protected void validate() {
+      Duration normalisedAbandonedTimeout   = normalisedAbandonedTimeout(abandonedTimeout);
+      Duration normalisedRetryCreationDelay = normalisedRetryCreationDelay(retryCreationDelay);
       if (poolName == null || poolName.isBlank()) {
         throw new IllegalArgumentException("poolName must not be null or blank");
       }
@@ -637,7 +637,7 @@ public class SimpleObjectPoolConfig {
       if (maxRetries > maxPoolSize) {
         log.warn("maxRetries is greater than maxPoolSize. This may result in excessive retries.");
       }
-      if (numValidationsPerEvictionRun == null || numValidationsPerEvictionRun < 0 || numValidationsPerEvictionRun > maxPoolSize) {
+      if (numValidationsPerEvictionRun != null && (numValidationsPerEvictionRun < 0 || numValidationsPerEvictionRun > maxPoolSize)) {
         throw new IllegalArgumentException("numValidationsPerEvictionRun must be between 0 and maxPoolSize");
       }
       if (evictionPolicy == null) {
@@ -659,34 +659,25 @@ public class SimpleObjectPoolConfig {
       if (waitingForObjectTimeout == null) {
         throw new IllegalArgumentException("waitingForObjectTimeout must not be null");
       }
-      if (retryCreationDelay == null) {
+      if (normalisedRetryCreationDelay == null) {
         throw new IllegalArgumentException("retryCreationDelay must not be null");
       }
-      if (retryCreationDelay.isPositive()) {
-        log.info("You have set a positive retryCreationDelay. The pool caps the delay at the remaining waitingForObjectTimeout, "
-                 + "so the total borrow time exceeds waitingForObjectTimeout only if the delay is larger than the remaining wait.");
+      if (normalisedRetryCreationDelay.isPositive()) {
+        log.info("You have set a positive retryCreationDelay. The pool caps the delay at the remaining waitingForObjectTimeout "
+                 + "and does not make another creation attempt after that wait has elapsed.");
       }
-      if (abandonedTimeout != null) {
+      if (normalisedAbandonedTimeout != null) {
         if (durationBetweenAbandonCheckRuns == null || durationBetweenAbandonCheckRuns.isNegative()
             || durationBetweenAbandonCheckRuns.isZero()) {
           throw new IllegalArgumentException("durationBetweenAbandonCheckRuns must be positive when abandonedTimeout is set");
         }
-        if (abandonedTimeout.compareTo(waitingForObjectTimeout) <= 0) {
+        if (normalisedAbandonedTimeout.compareTo(waitingForObjectTimeout) <= 0) {
           log.warn("abandonedTimeout is less than or equal to waitingForObjectTimeout. This may result in excessive actions on the pool.");
         }
       }
     }
 
     protected Builder prepareAndCheck() {
-      if (numValidationsPerEvictionRun == null) {
-        numValidationsPerEvictionRun = maxPoolSize;
-      }
-      if (abandonedTimeout != null && (abandonedTimeout.isZero() || abandonedTimeout.isNegative())) {
-        abandonedTimeout = null;
-      }
-      if (retryCreationDelay != null && retryCreationDelay.isNegative()) {
-        retryCreationDelay = Duration.ZERO;
-      }
       validate();
       return this;
     }
